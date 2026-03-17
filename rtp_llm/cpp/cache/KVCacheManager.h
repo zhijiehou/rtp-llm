@@ -136,6 +136,8 @@ private:
     const PDSepConfig                  pd_sep_config_;
     const CacheStoreConfig             cache_store_config_;
 
+    std::shared_ptr<CPSlotMapper> cp_slot_mapper_;
+
     std::atomic<bool> stop_{false};
     std::thread       metrics_reporter_thread_;
 

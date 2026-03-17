@@ -2,6 +2,14 @@ load("//:def.bzl", "copts")
 load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_library(
+    name = "cp_slot_mapper",
+    srcs = ["CPSlotMapper.cc"],
+    hdrs = ["CPSlotMapper.h"],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "cache_group_type",
     hdrs = [
         "CacheGroupType.h",
@@ -39,6 +47,7 @@ cc_library(
         ":block_info",
         ":batch_kv_cache_resource",
         ":cache_group_type",
+        ":cp_slot_mapper",
         "//:rtp_compute_ops",
         "//rtp_llm/cpp/config:config_modules",
         "//rtp_llm/cpp/core:types",

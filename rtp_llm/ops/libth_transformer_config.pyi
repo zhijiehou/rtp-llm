@@ -1357,6 +1357,7 @@ class ParallelismConfig:
 
 class PrefillCPConfig:
     comm_buffer_size: int
+    kv_cache_sharded: bool
     method: CPRotateMethod
 
     def __getstate__(self) -> tuple:
@@ -2047,5 +2048,5 @@ ALLTOALL: CPRotateMethod  # value = <CPRotateMethod.ALLTOALL: 3>
 ALL_GATHER: CPRotateMethod  # value = <CPRotateMethod.ALL_GATHER: 1>
 ALL_GATHER_WITH_OVERLAP: CPRotateMethod  # value = <CPRotateMethod.ALL_GATHER_WITH_OVERLAP: 2>
 DISABLED: CPRotateMethod  # value = <CPRotateMethod.DISABLED: 0>
-PREFILL_CP: CPRotateMethod  # value = <CPRotateMethod.PREFILL_CP: 4>
+: CPRotateMethod  # value = <CPRotateMethod.PREFILL_CP: 4>
 UNKNOWN: CPRotateMethod  # value = <CPRotateMethod.UNKNOWN: 5>
