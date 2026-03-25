@@ -1,5 +1,5 @@
 """
-Unit test for IndexerOp._get_topk_ragged_cp.
+Unit test for IndexerOp CP topk methods (_get_topk_ragged_cp_zigzag / _roundrobin).
 
 Tests the CP path for computing TopK indices in prefill with context parallel:
 single rank with one chunk so that generate_q_indices yields valid indices
@@ -39,7 +39,7 @@ def _check_cuda_deep_gemm():
 
 
 CUDA_DEEPGEMM_OK = _check_cuda_deep_gemm()
-SKIP_REASON = "CUDA and deep_gemm required for IndexerOp._get_topk_ragged_cp"
+SKIP_REASON = "CUDA and deep_gemm required for IndexerOp CP topk tests"
 
 
 def _setup_indexer_op_cp(
@@ -80,7 +80,7 @@ class FmhaParams:
 
 
 class GetTopkRaggedCPTest(TestCase):
-    """Test IndexerOp._get_topk_ragged_cp with single rank and one chunk."""
+    """Test IndexerOp._get_topk_ragged_cp_zigzag with single rank and one chunk."""
 
     def setUp(self):
         if not CUDA_DEEPGEMM_OK:
@@ -304,7 +304,92 @@ class GetTopkRaggedCPTest(TestCase):
         q0_idx_list, _q1_idx_list = generate_q_indices(chunk_lengths)
         n0 = len(q0_idx_list)
 
-        topk_result = op._get_topk_ragged_cp(
+        # Without the fix, this test would crash with a buffer underallocation
+        # because the gather kernel reads (prefix + new) tokens from cache but
+        # the buffer was only sized for new tokens.
+        index_n_heads = 32
+        index_head_dim = 128
+        index_topk = 2048
+        block_size = 128
+        rope_head_dim = 64
+        page_size = 64
+        prefix_len = 128
+        new_tokens = 8
+        total_kv = prefix_len + new_tokens
+        chunk_lengths = [new_tokens]
+        cp_rank = 0
+        cp_size = 1
+        device = self.device
+
+        op = _setup_indexer_op_cp(
+            index_n_heads,
+            index_head_dim,
+            index_topk,
+            block_size,
+            rope_head_dim,
+            chunk_lengths,
+            cp_rank,
+            device,
+        )
+        op.cu_kv_seqlens_global = torch.tensor(
+            [0, total_kv], dtype=torch.int32, device=device
+        )
+
+        q_fp8 = torch.randn(
+            new_tokens,
+            index_n_heads,
+            index_head_dim,
+            dtype=torch.float32,
+            device=device,
+        ).to(torch.float8_e4m3fn)
+        weights = torch.randn(
+            new_tokens, index_n_heads, 1, dtype=torch.float32, device=device
+        )
+
+        num_blocks = math.ceil(total_kv / page_size)
+        cache_stride = index_head_dim + (index_head_dim // block_size) * 4
+        kv_scale_base = torch.randn(
+            num_blocks,
+            block_size,
+            cache_stride,
+            device=device,
+        ).to(torch.uint8)
+        kv_cache = KVCache()
+        kv_cache.kv_scale_base = kv_scale_base
+
+        attn_inputs = PyAttentionInputs()
+        attn_inputs.kv_cache_block_id_device = torch.arange(
+            num_blocks, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        attn_inputs.cu_kv_seqlens = torch.tensor(
+            [0, total_kv], dtype=torch.int32, device=device
+        )
+
+        # ks/ke must cover the full KV range (prefix + new).
+        # For each new token j, it attends to [0, prefix_len + 1 + j).
+        k_offset = 0
+        ks_list = []
+        ke_list = []
+        seq_lens_list = []
+        for j in range(new_tokens):
+            seq_len_value = prefix_len + 1 + j
+            ks_list.append(k_offset)
+            ke_list.append(k_offset + seq_len_value)
+            seq_lens_list.append(seq_len_value)
+        ks = torch.tensor(ks_list, dtype=torch.int32, device=device)
+        ke = torch.tensor(ke_list, dtype=torch.int32, device=device)
+        expanded_seq_lens = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=device
+        )
+        topk_indices_offset = torch.zeros(new_tokens, dtype=torch.int32, device=device)
+
+        fmha_params = FmhaParams()
+        fmha_params.ks = ks
+        fmha_params.ke = ke
+        fmha_params.expanded_seq_lens = expanded_seq_lens
+        fmha_params.topk_indices_offset = topk_indices_offset
+
+        topk = op._get_topk_ragged_cp_zigzag(
             q_fp8,
             weights,
             kv_cache,
@@ -341,8 +426,8 @@ class GetTopkRaggedCPTest(TestCase):
             "With prefix_len=128, topk should reference some prefix positions",
         )
 
-    def test_workspace_buffer_reuse(self):
-        """Verify that workspace buffers are reused across calls."""
+    def test_zigzag_multiple_calls(self):
+        """Verify that zigzag topk works correctly across multiple calls."""
         index_n_heads = 32
         index_head_dim = 128
         index_topk = 2048
@@ -408,37 +493,25 @@ class GetTopkRaggedCPTest(TestCase):
             total_tokens, dtype=torch.int32, device=device
         )
 
-        self.assertIsNone(op._workspace_k_fp8)
-
-        op._get_topk_ragged_cp(
+        topk1 = op._get_topk_ragged_cp_zigzag(
             q_fp8,
             weights,
             kv_cache,
             fmha_params,
             attn_inputs,
-            cp_rank,
-            cp_size,
         )
+        self.assertIsNotNone(topk1)
 
-        self.assertIsNotNone(op._workspace_k_fp8)
-        buf1_ptr = op._workspace_k_fp8.data_ptr()
-
-        # Second call should reuse the same buffer
-        op._get_topk_ragged_cp(
+        # Second call should also succeed
+        topk2 = op._get_topk_ragged_cp_zigzag(
             q_fp8,
             weights,
             kv_cache,
             fmha_params,
             attn_inputs,
-            cp_rank,
-            cp_size,
         )
-
-        self.assertEqual(
-            op._workspace_k_fp8.data_ptr(),
-            buf1_ptr,
-            "Workspace buffer should be reused across calls",
-        )
+        self.assertIsNotNone(topk2)
+        self.assertEqual(topk1.shape, topk2.shape)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,12 @@ class Indexer(nn.Module):
         self.is_neox_style = attn_config.rope_config.indexer_is_neox_style
         self.parallelism_config = parallelism_config
 
+        cp = parallelism_config.prefill_cp_config
+        self._is_cp = cp.is_enabled()
+        self._is_roundrobin = (
+            self._is_cp and cp.processor_type == CPProcessorType.ROUND_ROBIN
+        )
+
         self.wq_b = LinearFactory.create_linear_from_weights(
             weights,
             W.mla_indexer_qb_w,
@@ -196,6 +202,90 @@ class Indexer(nn.Module):
         return self.indexer_op._get_topk_ragged(
             q_fp8, weights, kv_cache, fmha_params, attention_inputs
         )
+
+    # ---- CP helpers ----
+
+    def _setup_cp_params(self, cp_params: Any) -> None:
+        """Copy CP indices from cp_params into indexer_op state."""
+        op = self.indexer_op
+        op.q0_idx = cp_params.q0_idx
+        op.q1_idx = cp_params.q1_idx
+        op.q0_idx_global = cp_params.q0_idx_global
+        op.q1_idx_global = cp_params.q1_idx_global
+        op.kv_restore_unpad_indices = cp_params.kv_restore_unpad_indices
+        op.total_global_ids = cp_params.total_global_ids
+        op.total_local_ids = cp_params.total_local_ids
+        op.cu_kv_seqlens_global = cp_params.cu_kv_seqlens_global
+        op.total_kv_len = cp_params.total_kv_len
+
+        # Pre-compute workspace metadata for round-robin (reuse MLA block_table)
+        kv_cache_sharded = self._is_roundrobin and getattr(
+            cp_params, "kv_cache_sharded", False
+        )
+        if kv_cache_sharded:
+            op._ws_slot_mapping = cp_params.ws_slot_mapping
+            op._indexer_workspace_block_table = cp_params.ws_block_table
+            op._ws_total_pages = cp_params.ws_total_pages
+            op._cu_local_kv_seqlens = cp_params.cu_local_kv_seqlens
+            op._total_local_kv = cp_params.total_local_kv
+            op._kv_allgather_restore_indices = cp_params.kv_allgather_restore_indices
+            op._has_prefix_cache = getattr(cp_params, "has_prefix_cache", False)
+        else:
+            op._ws_slot_mapping = None
+            op._indexer_workspace_block_table = None
+            op._cu_local_kv_seqlens = None
+            op._total_local_kv = None
+            op._kv_allgather_restore_indices = None
+            op._has_prefix_cache = False
+
+    def _quant_q_k_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        kv_cache: KVCache,
+        slot_mapping: torch.Tensor,
+        attention_inputs: Any,
+        cp_params: Any,
+    ):
+        """CP quant: zigzag uses full cache, round-robin uses sharded cache + workspace."""
+        kv_cache_sharded = self._is_roundrobin and getattr(
+            cp_params, "kv_cache_sharded", False
+        )
+        return self.indexer_op.quant_q_k_cp(
+            query,
+            key,
+            kv_cache,
+            slot_mapping,
+            attention_inputs,
+            kv_cache_sharded=kv_cache_sharded,
+        )
+
+    def _get_topk_cp(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: KVCache,
+        fmha_params: Any,
+        attention_inputs: Any,
+    ):
+        """CP topk: zigzag reads from full cache, round-robin reads from workspace or gathers from sharded cache."""
+        if self._is_roundrobin:
+            return self.indexer_op._get_topk_ragged_cp_roundrobin(
+                q_fp8,
+                weights,
+                fmha_params,
+                kv_cache=kv_cache,
+                attention_inputs=attention_inputs,
+            )
+        return self.indexer_op._get_topk_ragged_cp_zigzag(
+            q_fp8,
+            weights,
+            kv_cache,
+            fmha_params,
+            attention_inputs,
+        )
+
+    # ---- forward ----
 
     def forward(
         self,

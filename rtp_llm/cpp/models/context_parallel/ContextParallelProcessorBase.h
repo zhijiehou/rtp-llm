@@ -12,11 +12,6 @@ namespace rtp_llm {
 
 struct GptModelInputs;
 
-enum class ProcessorType {
-    ZIG_ZAG,
-    // Future extensions: ROUND_ROBIN, BLOCK_WISE, etc.
-};
-
 class IContextParallelProcessor {
 public:
     explicit IContextParallelProcessor(const ParallelismConfig& parallelism_config):

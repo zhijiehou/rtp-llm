@@ -22,6 +22,8 @@
 
 using namespace std;
 
+#include <iostream>
+
 namespace rtp_llm {
 
 torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tensor) {

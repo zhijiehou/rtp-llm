@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/models/context_parallel/ContextParallelProcessorBase.h"
+#include "rtp_llm/cpp/models/context_parallel/RoundRobinProcessor.h"
 #include "rtp_llm/cpp/models/context_parallel/ZigzagProcessor.h"
 
 namespace rtp_llm {

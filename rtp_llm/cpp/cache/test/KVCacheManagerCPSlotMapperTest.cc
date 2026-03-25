@@ -42,7 +42,6 @@ static BatchKVCacheResourcePtr makeResource(int batch_size, int layer_num) {
     res->resetBatchSize(batch_size);
     std::vector<int> layer_to_group_id(layer_num, 0);
     res->initGroups(/*group_nums=*/1, layer_num, layer_to_group_id);
-
     return res;
 }
 
@@ -208,6 +207,7 @@ TEST_F(KVCacheManagerCPSlotMapperTest, InsertAutoInjectsMapper) {
     ASSERT_TRUE(mgr->init());
     // virtual_block_size = 4 * 2 = 8
     // effectiveSeqLenForAlloc(16) = ceil(16/8) * 4 = 8 tokens worth => ceil(8/4) = 2 blocks
+
     const int seq_len   = 16;
     auto      resource  = makeResource(1, config.layer_num);
     auto      token_ids = makeTokenIds(device_, 1, seq_len, seq_size_per_block);
@@ -230,7 +230,11 @@ TEST_F(KVCacheManagerCPSlotMapperTest, InsertAutoInjectsMapper) {
     malloc_info2.enable_device_cache = true;
     auto result2                     = mgr->malloc(malloc_info2);
     ASSERT_TRUE(result2.success);
-    EXPECT_GT(result2.reuse_len, 0);
+    // With CP sharding (cp_size=2, block_size=4), virtual_block_size=8.
+    // seq_len=16 produces 2 cache keys (each covering 8 tokens).
+    // match drops the last key → 1 matched key → reuse_len = 1 * virtual_block_size = 8.
+    // Before the matchSharded fix, this would incorrectly be 1 * seq_size_per_block = 4.
+    EXPECT_EQ(result2.reuse_len, seq_size_per_block * par.tp_size);  // = 4 * 2 = 8
 }
 
 }  // namespace test

@@ -1,5 +1,5 @@
 """
-Unit tests for SparseMlaFp8CPOp (Context Parallel prefill for Sparse MLA FP8).
+Unit tests for ZigZagSparseMlaFp8CPOp (Context Parallel prefill for Sparse MLA FP8).
 
 - tp_size=1: mock all_gather, compare to non-CP.
 - tp_size=2: two processes, real all_gather; merge outputs vs single-GPU non-CP (needs >=2 GPUs).
@@ -280,7 +280,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         Run both CP op and non-CP op on same inputs and check output shape and equality.
         """
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
             SparseMlaFp8Op,
@@ -385,7 +385,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         kv_cache = LayerKVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -407,7 +407,6 @@ class SparseMlaFp8CPOpTest(TestCase):
 
         topk0 = torch.index_select(topk_indices, 0, cp_op.q0_idx).contiguous()
         topk1 = torch.index_select(topk_indices, 0, cp_op.q1_idx).contiguous()
-        # CP forward expects single topk tensor aligned with total_local_ids (q0 then q1)
         topk_cat = torch.cat([topk0, topk1], dim=0)
         with patch(
             "rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl.all_gather",
@@ -441,7 +440,6 @@ class SparseMlaFp8CPOpTest(TestCase):
         non_cp_op.plan(mla_params, block_table_device)
         out_non_cp = non_cp_op.forward(q, kv_cache_flat, topk_indices, layer_id=0)
         torch.cuda.synchronize()
-
         self.assertTrue(
             torch.allclose(out_cp, out_non_cp, atol=1e-2, rtol=1e-2),
             "CP output should match non-CP when tp_size=1 (all_gather identity)",
@@ -450,7 +448,7 @@ class SparseMlaFp8CPOpTest(TestCase):
     def test_cp_op_forward_output_shape(self):
         """CP op forward returns correct shape [total_q_len, num_heads, kv_lora_rank]."""
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.mla_kv_cache_write_op import (
             MlaKVCacheWriteOp,
@@ -544,7 +542,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         kv_cache = LayerKVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -662,7 +660,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         Compare CP output (rank 0) against non-CP reference on full 72 tokens.
         """
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
             SparseMlaFp8Op,
@@ -885,7 +883,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         )
         torch.cuda.synchronize()
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
