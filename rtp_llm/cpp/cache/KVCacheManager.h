@@ -119,6 +119,10 @@ public:
         return coordinator_;
     }
 
+    BlockPoolPtr getBlockPool() const {
+        return allocator_ ? allocator_->getBlockPool() : nullptr;
+    }
+
 private:
     void initConnectorCoordinator();
     void allocateAndSync();
