@@ -1,5 +1,6 @@
 #define PYBIND11_DETAILED_ERROR_MESSAGES
 #include "rtp_llm/cpp/pybind/common/blockUtil.h"
+#include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/RoleTypes.h"
 #include "rtp_llm/cpp/config/SpecialTokens.h"
@@ -1591,4 +1592,20 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                 }
                 return c;
             }));
+
+    py::class_<CPSlotMapper, std::shared_ptr<CPSlotMapper>>(m, "CPSlotMapper")
+        .def(py::init<>())
+        .def(py::init<int, int, int>(), py::arg("cp_rank"), py::arg("cp_size"), py::arg("block_size"))
+        .def("is_sharded", &CPSlotMapper::isSharded)
+        .def("cp_rank", &CPSlotMapper::cpRank)
+        .def("cp_size", &CPSlotMapper::cpSize)
+        .def("block_size", &CPSlotMapper::blockSize)
+        .def("virtual_block_size", &CPSlotMapper::virtualBlockSize)
+        .def("target_rank", &CPSlotMapper::targetRank)
+        .def("is_owned", &CPSlotMapper::isOwned)
+        .def("local_block_offset", &CPSlotMapper::localBlockOffset)
+        .def("virtual_block_count", &CPSlotMapper::virtualBlockCount)
+        .def("local_block_count", &CPSlotMapper::localBlockCount)
+        .def("compute_slot", &CPSlotMapper::computeSlot)
+        .def("owned_positions", &CPSlotMapper::ownedPositions);
 }

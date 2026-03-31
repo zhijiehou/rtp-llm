@@ -7,6 +7,7 @@ cc_library(
     srcs = glob(["*.cc"]),
     hdrs = glob(["*.h"]),
     deps = [
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/models_py/bindings:op_defs",
         "//rtp_llm/cpp/core:op_data",
         "//rtp_llm/cpp/core:exec_ops_hdr",

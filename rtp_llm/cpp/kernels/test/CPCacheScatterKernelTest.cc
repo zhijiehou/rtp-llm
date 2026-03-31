@@ -1,59 +1,63 @@
 #include <gtest/gtest.h>
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <vector>
 
 #include "rtp_llm/cpp/kernels/cp_cache_scatter_kernel.h"
-#include "rtp_llm/cpp/devices/DeviceFactory.h"
-#include "rtp_llm/cpp/core/Buffer.h"
-#include "rtp_llm/cpp/utils/Logger.h"
-#include "rtp_llm/cpp/config/ConfigModules.h"
 
 namespace rtp_llm {
 namespace test {
 
-class CPCacheScatterKernelTest: public ::testing::Test {
-protected:
-    void SetUp() override {
-        rtp_llm::initLogger();
-        rtp_llm::ParallelismConfig           parallelism_config;
-        rtp_llm::ModelConfig                 model_config;
-        rtp_llm::EPLBConfig                  eplb_config;
-        rtp_llm::FMHAConfig                  fmha_config;
-        rtp_llm::DeviceResourceConfig        device_resource_config;
-        rtp_llm::MoeConfig                   moe_config;
-        rtp_llm::SpeculativeExecutionConfig  sp_config;
-        rtp_llm::MiscellaneousConfig         misc_config;
-        rtp_llm::ProfilingDebugLoggingConfig profiling_debug_logging_config;
-        rtp_llm::HWKernelConfig              hw_kernel_config;
-        rtp_llm::ConcurrencyConfig           concurrency_config;
-        rtp_llm::FfnDisAggregateConfig       ffn_disaggregate_config;
-        rtp_llm::RuntimeConfig               runtime_config;
-        rtp_llm::ModelSpecificConfig         model_specific_config;
-
-        device_resource_config.device_reserve_memory_bytes = 2048000000;
-        device_resource_config.host_reserve_memory_bytes   = 0;
-
-        rtp_llm::DeviceFactory::initDevices(parallelism_config,
-                                            model_config,
-                                            eplb_config,
-                                            fmha_config,
-                                            device_resource_config,
-                                            moe_config,
-                                            sp_config,
-                                            misc_config,
-                                            profiling_debug_logging_config,
-                                            hw_kernel_config,
-                                            concurrency_config,
-                                            ffn_disaggregate_config,
-                                            runtime_config,
-                                            model_specific_config,
-                                            rtp_llm::NcclCommConfig{});
-        device_ = rtp_llm::DeviceFactory::getDefaultDevice();
-        ASSERT_NE(device_, nullptr);
+// RAII wrapper around cudaMalloc / cudaFree.
+class GpuBuffer {
+public:
+    explicit GpuBuffer(size_t bytes): bytes_(bytes) {
+        cudaMalloc(&ptr_, bytes_);
     }
 
+    GpuBuffer(const void* host_data, size_t bytes): bytes_(bytes) {
+        cudaMalloc(&ptr_, bytes_);
+        cudaMemcpy(ptr_, host_data, bytes_, cudaMemcpyHostToDevice);
+    }
+
+    ~GpuBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+
+    GpuBuffer(const GpuBuffer&)            = delete;
+    GpuBuffer& operator=(const GpuBuffer&) = delete;
+
+    void* data() {
+        return ptr_;
+    }
+
+    template<typename T>
+    T* data() {
+        return static_cast<T*>(ptr_);
+    }
+
+    void copyFromHost(const void* src, size_t bytes) {
+        cudaMemcpy(ptr_, src, bytes, cudaMemcpyHostToDevice);
+    }
+
+    void copyToHost(void* dst, size_t bytes) const {
+        cudaMemcpy(dst, ptr_, bytes, cudaMemcpyDeviceToHost);
+    }
+
+private:
+    void*  ptr_   = nullptr;
+    size_t bytes_ = 0;
+};
+
+using GpuBufferPtr = std::unique_ptr<GpuBuffer>;
+
+class CPCacheScatterKernelTest: public ::testing::Test {
+protected:
     /// Build a temp buffer simulating RDMA-received data from cp_size prefill peers,
     /// run the scatter kernel, and verify decode blocks contain contiguous tokens.
     ///
@@ -91,12 +95,11 @@ protected:
             }
         }
 
-        auto temp_gpu = device_->allocateBuffer({DataType::TYPE_BYTES, {temp_size}, AllocationType::DEVICE}, {});
-        device_->copy({*temp_gpu, Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {temp_size}, temp_host.data())});
+        auto temp_gpu = std::make_unique<GpuBuffer>(temp_host.data(), temp_size);
 
         // --- Allocate decode blocks (identity block IDs for simplicity) ---
         const size_t dst_total = static_cast<size_t>(decode_blocks) * block_bytes;
-        auto         dst_gpu = device_->allocateBuffer({DataType::TYPE_BYTES, {dst_total}, AllocationType::DEVICE}, {});
+        auto         dst_gpu   = std::make_unique<GpuBuffer>(dst_total);
 
         std::vector<void*> dst_addrs(decode_blocks);
         std::vector<int>   dst_ids(decode_blocks);
@@ -105,15 +108,8 @@ protected:
             dst_ids[i]   = i;
         }
 
-        auto dst_addrs_gpu =
-            device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-        auto dst_ids_gpu =
-            device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-        device_->copy(
-            {*dst_addrs_gpu,
-             Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)decode_blocks}, dst_addrs.data())});
-        device_->copy({*dst_ids_gpu,
-                       Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)decode_blocks}, dst_ids.data())});
+        auto dst_addrs_gpu = std::make_unique<GpuBuffer>(dst_addrs.data(), decode_blocks * sizeof(void*));
+        auto dst_ids_gpu   = std::make_unique<GpuBuffer>(dst_ids.data(), decode_blocks * sizeof(int));
 
         // --- Run kernel ---
         invokeCPCacheScatter(reinterpret_cast<void**>(dst_addrs_gpu->data()),
@@ -125,12 +121,12 @@ protected:
                              total_tokens,
                              elem_stride_bytes,
                              nullptr);
-        device_->syncAndCheck();
+        cudaDeviceSynchronize();
 
         // --- Verify ---
         std::vector<uint8_t> result(dst_total);
-        device_->copy({Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {dst_total}, result.data()), *dst_gpu});
-        device_->syncAndCheck();
+        dst_gpu->copyToHost(result.data(), dst_total);
+        cudaDeviceSynchronize();
 
         for (int t = 0; t < total_tokens; ++t) {
             int            blk      = t / block_size;
@@ -142,8 +138,6 @@ protected:
             }
         }
     }
-
-    DeviceBase* device_ = nullptr;
 };
 
 // Full virtual blocks
@@ -232,28 +226,21 @@ TEST_F(CPCacheScatterKernelTest, NonContiguousBlockIds) {
             std::memset(slot_ptr + s * elem_stride_bytes, tag, elem_stride_bytes);
         }
     }
-    auto temp_gpu = device_->allocateBuffer({DataType::TYPE_BYTES, {temp_size}, AllocationType::DEVICE}, {});
-    device_->copy({*temp_gpu, Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {temp_size}, temp_host.data())});
+    auto temp_gpu = std::make_unique<GpuBuffer>(temp_host.data(), temp_size);
 
     // Shuffled decode block IDs: [7, 3, 11, 1]
     std::vector<int> dst_ids   = {7, 3, 11, 1};
     int              max_bid   = 12;
     const size_t     dst_total = static_cast<size_t>(max_bid) * block_bytes;
-    auto             dst_gpu = device_->allocateBuffer({DataType::TYPE_BYTES, {dst_total}, AllocationType::DEVICE}, {});
+    auto             dst_gpu   = std::make_unique<GpuBuffer>(dst_total);
 
     std::vector<void*> dst_addrs(max_bid);
     for (int i = 0; i < max_bid; ++i) {
         dst_addrs[i] = static_cast<char*>(dst_gpu->data()) + i * block_bytes;
     }
 
-    auto dst_addrs_gpu =
-        device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)max_bid}, AllocationType::DEVICE}, {});
-    auto dst_ids_gpu =
-        device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-    device_->copy(
-        {*dst_addrs_gpu, Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)max_bid}, dst_addrs.data())});
-    device_->copy(
-        {*dst_ids_gpu, Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)decode_blocks}, dst_ids.data())});
+    auto dst_addrs_gpu = std::make_unique<GpuBuffer>(dst_addrs.data(), max_bid * sizeof(void*));
+    auto dst_ids_gpu   = std::make_unique<GpuBuffer>(dst_ids.data(), decode_blocks * sizeof(int));
 
     invokeCPCacheScatter(reinterpret_cast<void**>(dst_addrs_gpu->data()),
                          dst_ids_gpu->data<int>(),
@@ -264,11 +251,11 @@ TEST_F(CPCacheScatterKernelTest, NonContiguousBlockIds) {
                          total_tokens,
                          elem_stride_bytes,
                          nullptr);
-    device_->syncAndCheck();
+    cudaDeviceSynchronize();
 
     std::vector<uint8_t> result(dst_total);
-    device_->copy({Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {dst_total}, result.data()), *dst_gpu});
-    device_->syncAndCheck();
+    dst_gpu->copyToHost(result.data(), dst_total);
+    cudaDeviceSynchronize();
 
     for (int t = 0; t < total_tokens; ++t) {
         int            blk_idx  = t / block_size;
@@ -303,15 +290,13 @@ protected:
         const size_t block_bytes   = static_cast<size_t>(block_size) * elem_stride_bytes;
 
         // Allocate individual src/dst blocks (non-contiguous)
-        std::vector<BufferPtr> src_block_bufs(staging_cnt);
-        std::vector<BufferPtr> dst_block_bufs(decode_blocks);
+        std::vector<GpuBufferPtr> src_block_bufs(staging_cnt);
+        std::vector<GpuBufferPtr> dst_block_bufs(decode_blocks);
         for (int i = 0; i < staging_cnt; ++i) {
-            src_block_bufs[i] =
-                device_->allocateBuffer({DataType::TYPE_BYTES, {block_bytes}, AllocationType::DEVICE}, {});
+            src_block_bufs[i] = std::make_unique<GpuBuffer>(block_bytes);
         }
         for (int i = 0; i < decode_blocks; ++i) {
-            dst_block_bufs[i] =
-                device_->allocateBuffer({DataType::TYPE_BYTES, {block_bytes}, AllocationType::DEVICE}, {});
+            dst_block_bufs[i] = std::make_unique<GpuBuffer>(block_bytes);
         }
 
         // Use shuffled block IDs to test indirection
@@ -349,31 +334,15 @@ protected:
                     uint8_t tag = static_cast<uint8_t>(global_token & 0xFF);
                     std::memset(block_host.data() + s * elem_stride_bytes, tag, elem_stride_bytes);
                 }
-                device_->copy({*src_block_bufs[src_idx],
-                               Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {block_bytes}, block_host.data())});
+                src_block_bufs[src_idx]->copyFromHost(block_host.data(), block_bytes);
             }
         }
 
         // Upload address tables and IDs to GPU
-        auto src_addrs_gpu =
-            device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)addr_table_size}, AllocationType::DEVICE}, {});
-        auto dst_addrs_gpu =
-            device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)addr_table_size}, AllocationType::DEVICE}, {});
-        auto src_ids_gpu =
-            device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)staging_cnt}, AllocationType::DEVICE}, {});
-        auto dst_ids_gpu =
-            device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-
-        device_->copy(
-            {*src_addrs_gpu,
-             Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)addr_table_size}, src_addrs.data())});
-        device_->copy(
-            {*dst_addrs_gpu,
-             Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)addr_table_size}, dst_addrs.data())});
-        device_->copy({*src_ids_gpu,
-                       Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)staging_cnt}, src_ids.data())});
-        device_->copy({*dst_ids_gpu,
-                       Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)decode_blocks}, dst_ids.data())});
+        auto src_addrs_gpu = std::make_unique<GpuBuffer>(src_addrs.data(), addr_table_size * sizeof(void*));
+        auto dst_addrs_gpu = std::make_unique<GpuBuffer>(dst_addrs.data(), addr_table_size * sizeof(void*));
+        auto src_ids_gpu   = std::make_unique<GpuBuffer>(src_ids.data(), staging_cnt * sizeof(int));
+        auto dst_ids_gpu   = std::make_unique<GpuBuffer>(dst_ids.data(), decode_blocks * sizeof(int));
 
         // Run paged kernel
         invokeCPCacheScatterPaged(reinterpret_cast<void**>(dst_addrs_gpu->data()),
@@ -387,7 +356,7 @@ protected:
                                   elem_stride_bytes,
                                   addr_table_size,
                                   nullptr);
-        device_->syncAndCheck();
+        cudaDeviceSynchronize();
 
         // Verify: each decode block should contain contiguous tokens
         for (int t = 0; t < total_tokens; ++t) {
@@ -396,9 +365,8 @@ protected:
             uint8_t expected = static_cast<uint8_t>(t & 0xFF);
 
             std::vector<uint8_t> block_host(block_bytes);
-            device_->copy({Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {block_bytes}, block_host.data()),
-                           *dst_block_bufs[blk_idx]});
-            device_->syncAndCheck();
+            dst_block_bufs[blk_idx]->copyToHost(block_host.data(), block_bytes);
+            cudaDeviceSynchronize();
 
             const uint8_t* ptr = block_host.data() + slot * elem_stride_bytes;
             for (int b = 0; b < elem_stride_bytes; ++b) {
@@ -495,15 +463,14 @@ TEST_F(CPCacheScatterPagedKernelTest, MatchesContiguousKernel) {
             }
         }
     }
-    auto temp_gpu = device_->allocateBuffer({DataType::TYPE_BYTES, {temp_size}, AllocationType::DEVICE}, {});
-    device_->copy({*temp_gpu, Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {temp_size}, temp_host.data())});
+    auto temp_gpu = std::make_unique<GpuBuffer>(temp_host.data(), temp_size);
 
     // Allocate two sets of decode blocks: one for contiguous, one for paged
-    auto dst_contig = device_->allocateBuffer(
-        {DataType::TYPE_BYTES, {(size_t)decode_blocks * block_bytes}, AllocationType::DEVICE}, {});
-    std::vector<BufferPtr> dst_paged_bufs(decode_blocks);
+    const size_t              dst_contig_bytes = static_cast<size_t>(decode_blocks) * block_bytes;
+    auto                      dst_contig       = std::make_unique<GpuBuffer>(dst_contig_bytes);
+    std::vector<GpuBufferPtr> dst_paged_bufs(decode_blocks);
     for (int i = 0; i < decode_blocks; ++i)
-        dst_paged_bufs[i] = device_->allocateBuffer({DataType::TYPE_BYTES, {block_bytes}, AllocationType::DEVICE}, {});
+        dst_paged_bufs[i] = std::make_unique<GpuBuffer>(block_bytes);
 
     // Identity IDs for both
     std::vector<int> dst_ids(decode_blocks);
@@ -525,34 +492,12 @@ TEST_F(CPCacheScatterPagedKernelTest, MatchesContiguousKernel) {
         paged_src_addrs[i] = static_cast<char*>(temp_gpu->data()) + i * block_bytes;
 
     // Upload all tables to GPU
-    auto contig_addrs_gpu =
-        device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-    auto contig_ids_gpu =
-        device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-    auto paged_dst_addrs_gpu =
-        device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-    auto paged_dst_ids_gpu =
-        device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)decode_blocks}, AllocationType::DEVICE}, {});
-    auto paged_src_addrs_gpu =
-        device_->allocateBuffer({DataType::TYPE_UINT64, {(size_t)staging_cnt}, AllocationType::DEVICE}, {});
-    auto paged_src_ids_gpu =
-        device_->allocateBuffer({DataType::TYPE_INT32, {(size_t)staging_cnt}, AllocationType::DEVICE}, {});
-
-    device_->copy(
-        {*contig_addrs_gpu,
-         Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)decode_blocks}, contig_addrs.data())});
-    device_->copy({*contig_ids_gpu,
-                   Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)decode_blocks}, dst_ids.data())});
-    device_->copy(
-        {*paged_dst_addrs_gpu,
-         Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)decode_blocks}, paged_dst_addrs.data())});
-    device_->copy({*paged_dst_ids_gpu,
-                   Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)decode_blocks}, dst_ids.data())});
-    device_->copy(
-        {*paged_src_addrs_gpu,
-         Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_UINT64, {(size_t)staging_cnt}, paged_src_addrs.data())});
-    device_->copy({*paged_src_ids_gpu,
-                   Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_INT32, {(size_t)staging_cnt}, src_ids.data())});
+    auto contig_addrs_gpu    = std::make_unique<GpuBuffer>(contig_addrs.data(), decode_blocks * sizeof(void*));
+    auto contig_ids_gpu      = std::make_unique<GpuBuffer>(dst_ids.data(), decode_blocks * sizeof(int));
+    auto paged_dst_addrs_gpu = std::make_unique<GpuBuffer>(paged_dst_addrs.data(), decode_blocks * sizeof(void*));
+    auto paged_dst_ids_gpu   = std::make_unique<GpuBuffer>(dst_ids.data(), decode_blocks * sizeof(int));
+    auto paged_src_addrs_gpu = std::make_unique<GpuBuffer>(paged_src_addrs.data(), staging_cnt * sizeof(void*));
+    auto paged_src_ids_gpu   = std::make_unique<GpuBuffer>(src_ids.data(), staging_cnt * sizeof(int));
 
     // Run both kernels
     invokeCPCacheScatter(reinterpret_cast<void**>(contig_addrs_gpu->data()),
@@ -576,19 +521,17 @@ TEST_F(CPCacheScatterPagedKernelTest, MatchesContiguousKernel) {
                               elem_stride_bytes,
                               decode_blocks,
                               nullptr);
-    device_->syncAndCheck();
+    cudaDeviceSynchronize();
 
     // Compare results byte-by-byte
     for (int blk = 0; blk < decode_blocks; ++blk) {
         std::vector<uint8_t> contig_data(block_bytes), paged_data(block_bytes);
-        device_->copy({Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {block_bytes}, contig_data.data()),
-                       Buffer(MemoryType::MEMORY_GPU,
-                              DataType::TYPE_BYTES,
-                              {block_bytes},
-                              static_cast<char*>(dst_contig->data()) + blk * block_bytes)});
-        device_->copy({Buffer(MemoryType::MEMORY_CPU, DataType::TYPE_BYTES, {block_bytes}, paged_data.data()),
-                       *dst_paged_bufs[blk]});
-        device_->syncAndCheck();
+        cudaMemcpy(contig_data.data(),
+                   static_cast<char*>(dst_contig->data()) + blk * block_bytes,
+                   block_bytes,
+                   cudaMemcpyDeviceToHost);
+        dst_paged_bufs[blk]->copyToHost(paged_data.data(), block_bytes);
+        cudaDeviceSynchronize();
 
         for (size_t b = 0; b < block_bytes; ++b) {
             ASSERT_EQ(contig_data[b], paged_data[b]) << "mismatch at block=" << blk << " byte=" << b;

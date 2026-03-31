@@ -41,6 +41,7 @@ cc_library(
         "//conditions:default": [],
     }),
     deps = [
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/core:device_data",
         "//rtp_llm/cpp/core:devices_base",
         "//rtp_llm/cpp/core:distributed_comm_hdr",

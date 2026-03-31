@@ -33,6 +33,7 @@ cc_library(
         "BufferTypes.h",
         "CacheConfig.h",
         "CacheGroupType.h",
+        "CPSlotMapper.h",
         "KVCacheSpec.h",
         "KVCacheSpecBase.h",
         "MHAKVCacheSpec.h",
@@ -224,6 +225,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cache",
+        "//rtp_llm/cpp/core:exec_ops_hdr",
+        "//rtp_llm/cpp/cuda:cuda_host_utils",
         "//rtp_llm/cpp/kernels:cp_cache_scatter",
     ],
 )

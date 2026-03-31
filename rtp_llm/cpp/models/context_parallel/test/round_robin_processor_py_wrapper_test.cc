@@ -11,6 +11,7 @@ namespace unittest {
 
 class RoundRobinProcessorTestWrapper: public RoundRobinProcessor {
 public:
+    RoundRobinProcessorTestWrapper(): RoundRobinProcessor(ParallelismConfig{}) {}
     using RoundRobinProcessor::plan;
     using RoundRobinProcessor::generateQKVRestoreIndices;
     using RoundRobinProcessor::generateQKVPaddingMask;

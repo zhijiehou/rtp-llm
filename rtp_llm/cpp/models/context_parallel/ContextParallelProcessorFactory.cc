@@ -9,6 +9,8 @@ ContextParallelProcessorFactory::create(ProcessorType type, const ParallelismCon
     switch (type) {
         case ProcessorType::ZIG_ZAG:
             return std::make_unique<ZigZagProcessor>(parallelism_config);
+        case ProcessorType::ROUND_ROBIN:
+            return std::make_unique<RoundRobinProcessor>(parallelism_config);
         default:
             return std::make_unique<ZigZagProcessor>(parallelism_config);
     }

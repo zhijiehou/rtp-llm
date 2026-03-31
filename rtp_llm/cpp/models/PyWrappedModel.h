@@ -235,9 +235,12 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     cache_store_async_writer_ = std::make_unique<CacheStoreAsyncWriter>();
 
     if (device_props_.enable_prefill_cp) {
-        context_parallel_processor_ =
-            ContextParallelProcessorFactory::create(ProcessorType::ZIG_ZAG, params.parallelism_config);
-        RTP_LLM_LOG_INFO("Context parallel processor initialized with ZIG_ZAG strategy.");
+        auto proc_type              = (device_props_.cp_processor_type == CPProcessorType::ROUND_ROBIN) ?
+                                          ProcessorType::ROUND_ROBIN :
+                                          ProcessorType::ZIG_ZAG;
+        context_parallel_processor_ = ContextParallelProcessorFactory::create(proc_type, params.parallelism_config);
+        RTP_LLM_LOG_INFO("Context parallel processor initialized with %s strategy.",
+                         proc_type == ProcessorType::ROUND_ROBIN ? "ROUND_ROBIN" : "ZIG_ZAG");
     }
 
     RTP_LLM_LOG_INFO("PyWrappedModel initialized done.");

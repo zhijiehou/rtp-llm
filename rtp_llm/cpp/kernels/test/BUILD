@@ -1,5 +1,4 @@
 load("//:def.bzl", "cc_test_wrapper", "copts")
-load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_test = cc_test_wrapper
 
@@ -15,14 +14,11 @@ cc_test(
     copts = test_copts,
     deps = [
         "//rtp_llm/cpp/kernels:cp_cache_scatter",
-        "//rtp_llm/cpp/devices/cuda_impl:cuda_impl",
-        "//rtp_llm/cpp/config:config_modules",
-        "//rtp_llm/cpp/utils:core_utils",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
-    ] + torch_deps(),
+    ],
     exec_properties = {'gpu': 'A10'},
 )
 

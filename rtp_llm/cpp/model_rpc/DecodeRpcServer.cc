@@ -6,6 +6,8 @@
 #include <condition_variable>
 
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
+#include "rtp_llm/cpp/core/ExecOps.h"
+#include "rtp_llm/cpp/cuda/cuda_host_utils.h"
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/utils/HashUtil.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
@@ -411,7 +413,6 @@ ErrorInfo DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_con
             string error_msg = "get grpc connection for rank:" + std::to_string(i) + ", addr:" + worker + " failed";
             return ErrorInfo(ErrorCode::GET_CONNECTION_FAILED, error_msg);
         }
-        all_context.push_back(WorkerRpcContext());
         auto& rpc_context = all_context[i];
         rpc_context.stub  = connect_status.value().stub;
         BroadcastLoadRequestPB load_request;
@@ -618,7 +619,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     RTP_LLM_PROFILE_FUNCTION();
     AtomicGuard request_guard(onflight_load_cache_requests_);
     const auto& request_key = load_context.request_key;
-    engine_->getDevice()->preRun();
+    cudaPreRun(getDevice());
     auto        cache_manager = engine_->resourceContext().cache_manager;
     const auto& cache_config  = cache_manager->cacheConfig();
     auto        layer_num     = maga_init_params_.model_config_.num_layers;
@@ -671,7 +672,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     std::unique_ptr<CPCacheScatterHelper::StagingPlan> staging_plan;
     if (vblock_count > 0) {
         if (!scatter_helper_) {
-            scatter_helper_ = std::make_unique<CPCacheScatterHelper>(cache_manager.get(), engine_->getDevice());
+            scatter_helper_ = std::make_unique<CPCacheScatterHelper>(cache_manager.get());
         }
         staging_plan = scatter_helper_->prepareStagingPlan(vblock_count, cp_size, layer_num);
     }

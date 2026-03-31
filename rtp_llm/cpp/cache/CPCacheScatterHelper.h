@@ -10,7 +10,6 @@
 namespace rtp_llm {
 
 class KVCacheManager;
-class DeviceBase;
 class BlockPool;
 
 /// Encapsulates the staging-block lifecycle and GPU scatter kernel invocation
@@ -46,21 +45,14 @@ public:
         BlockPool* block_pool_ = nullptr;
     };
 
-    CPCacheScatterHelper(KVCacheManager* cache_manager, DeviceBase* device);
+    explicit CPCacheScatterHelper(KVCacheManager* cache_manager);
     ~CPCacheScatterHelper();
 
     CPCacheScatterHelper(const CPCacheScatterHelper&)            = delete;
     CPCacheScatterHelper& operator=(const CPCacheScatterHelper&) = delete;
 
-    /// Phase 1: Allocate staging blocks and resolve per-layer GPU addresses.
-    /// Returns a StagingPlan whose layer_infos can be used to build
-    /// RequestBlockBuffer entries for RDMA receive.
-    /// Throws on allocation failure.
     std::unique_ptr<StagingPlan> prepareStagingPlan(int vblock_count, int cp_size, size_t layer_num);
 
-    /// Phase 2: Run the paged scatter kernel to copy tokens from staging blocks
-    /// into contiguous decode blocks, then release staging blocks.
-    /// The plan is consumed (moved) and freed after scatter completes.
     void scatterAndRelease(std::unique_ptr<StagingPlan> plan,
                            const GroupBlockIds&         block_ids_by_group,
                            const CacheConfig&           cache_config,
@@ -71,7 +63,6 @@ private:
     void* getOrCreateScatterStream();
 
     KVCacheManager* cache_manager_;
-    DeviceBase*     device_;
     void*           scatter_stream_ = nullptr;
     std::once_flag  scatter_stream_init_;
 };

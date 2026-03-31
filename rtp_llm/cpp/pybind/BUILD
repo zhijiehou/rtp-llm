@@ -34,6 +34,7 @@ cc_library(
     ],
     deps = [
         ":py_utils",
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/config:config_modules",
         "//rtp_llm/cpp/config:model_config",  # Add ModelConfig implementation
         "//rtp_llm/cpp/model_utils:model_utils",
@@ -58,6 +59,7 @@ cc_library(
     deps = [
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/cpp/core:devices_base",
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/utils:debug_utils",
         "//rtp_llm/cpp/utils:device_perf_wrapper",
         "@havenask//aios/autil:base64",

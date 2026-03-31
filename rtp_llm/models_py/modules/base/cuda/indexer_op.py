@@ -389,9 +389,9 @@ class IndexerOp(nn.Module):
         )
 
         if kv_cache_sharded:
-            assert local_indexer_slot_mapping is not None, (
-                "local_indexer_slot_mapping is required when kv_cache_sharded=True"
-            )
+            assert (
+                local_indexer_slot_mapping is not None
+            ), "local_indexer_slot_mapping is required when kv_cache_sharded=True"
             rtp_llm_ops.indexer_k_quant_and_cache(
                 key,
                 kv_cache.kv_scale_base,
@@ -640,7 +640,7 @@ class IndexerOp(nn.Module):
             device=device,
         )
         rtp_llm_ops.cp_gather_indexer_k_quant_cache(
-            cache_tensor,
+            kv_cache.kv_scale_base,
             k_fp8,
             k_scale,
             attention_inputs.kv_cache_kernel_block_id_device,
@@ -715,11 +715,23 @@ class IndexerOp(nn.Module):
         total_kv_tokens = self.kv_len
         assert total_kv_tokens is not None and total_kv_tokens > 0
 
-        k_fp8, k_scale = self._gather_kv_fp8(
-            total_kv_tokens,
+        device = q_fp8.device
+        k_fp8 = torch.empty(
+            (total_kv_tokens, self.index_head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        k_scale = torch.empty(
+            (total_kv_tokens, self.index_head_dim // self.block_size * 4),
+            dtype=torch.uint8,
+            device=device,
+        )
+        rtp_llm_ops.cp_gather_indexer_k_quant_cache(
             kv_cache.kv_scale_base,
-            attention_inputs.kv_cache_block_id_device,
-            q_fp8.device,
+            k_fp8,
+            k_scale,
+            attention_inputs.kv_cache_kernel_block_id_device,
+            self.cu_kv_seqlens_global,
         )
         kv_fp8 = (k_fp8, k_scale.view(torch.float32))
         return self._run_cp_logits_topk(q_fp8, weights, kv_fp8, fmha_params)
@@ -753,12 +765,13 @@ class IndexerOp(nn.Module):
             kv_cache.kv_scale_base,
             k_fp8_local,
             k_scale_local,
-            attention_inputs.kv_cache_block_id_device,
+            attention_inputs.kv_cache_kernel_block_id_device,
             self._cu_local_kv_seqlens,
         )
 
-        if total_local_ids.size(0) > 0:
-            topk = run_part_logits_topk(q0, total_global_ids, weights_sq0)
-        else:
-            topk = None
-        return topk
+        # all-gather across CP ranks and restore global order
+        k_fp8_global, k_scale_global = self._allgather_and_restore_kv(
+            k_fp8_local, k_scale_local, total_kv_tokens
+        )
+        kv_fp8 = (k_fp8_global, k_scale_global.view(torch.float32))
+        return self._run_cp_logits_topk(q_fp8, weights, kv_fp8, fmha_params)

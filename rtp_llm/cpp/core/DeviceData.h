@@ -180,6 +180,7 @@ inline ExecProperties buildExecProperties(const ExecInitParams& p) {
     props.is_eagle3                = p.is_eagle3;
     props.ffn_as_service           = p.ffn_as_service;
     props.enable_prefill_cp        = p.enable_prefill_cp;
+    props.cp_processor_type        = p.cp_processor_type;
     return props;
 }
 

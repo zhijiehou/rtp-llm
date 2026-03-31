@@ -5,6 +5,11 @@ from librtp_compute_ops.rtp_llm_ops import *
 
 from rtp_llm.models_py.utils.arch import is_cuda
 
+try:
+    from rtp_llm.ops import CPSlotMapper
+except ImportError:
+    pass
+
 if is_cuda():
     logging.info("Use rtp_kernel FusedRopeKVCacheOp on CUDA device.")
 

@@ -96,6 +96,11 @@ public:
     void                        setCacheStore(std::shared_ptr<CacheStore> cache_store);
     std::shared_ptr<CacheStore> getCacheStore() const;
 
+    // CP slot mapper for round-robin KV cache sharding
+    std::shared_ptr<CPSlotMapper> cpSlotMapper() const {
+        return cp_slot_mapper_;
+    }
+
     // 异步连接器操作
     // async load cache from connector to gpu, for all rank
     std::shared_ptr<AsyncContext>

@@ -103,6 +103,7 @@ cc_library(
     deps = [
         ":context_parallel_interface",
         "//:rtp_compute_ops",
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/core:exec_ops_hdr",
         "//rtp_llm/cpp/utils:core_utils",
     ],

@@ -43,6 +43,7 @@ cc_library(
     ]),
     copts = cuda_copts(),
     deps = torch_deps() + [
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/cuda/ops:cuda_impl",
         "//rtp_llm/cpp/core:types_hdr",
         "//rtp_llm/cpp/kernels:scaled_fp8_quant",
@@ -98,6 +99,7 @@ cc_library(
     ],
     copts = copts(),
     deps = [
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/models_py/bindings:register_ops_hdr",
         ":cuda_bindings_base",
         ":cuda_attn_bindings_base"
