@@ -160,7 +160,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
             const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
             if (bin > threshold_bin) {
                 const auto pos = ::atomicAdd(&s_counter, 1);
-                index[pos]     = idx;
+                if (pos < TopK)
+                    index[pos] = idx;
             }
         }
         __syncthreads();
@@ -177,7 +178,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
             const auto bin       = static_cast<int>(convert_to_uint8(raw_input));
             if (bin > threshold_bin) {
                 const auto pos = ::atomicAdd(&s_counter, 1);
-                index[pos]     = idx;
+                if (pos < TopK)
+                    index[pos] = idx;
             } else if (bin == threshold_bin) {
                 const auto pos = ::atomicAdd(&s_num_input[0], 1);
                 /// NOTE: (dark) fuse the histogram computation here
@@ -220,7 +222,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
                 const auto bin    = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
                 if (bin > threshold_bin) {
                     const auto pos = ::atomicAdd(&s_counter, 1);
-                    index[pos]     = idx;
+                    if (pos < TopK)
+                        index[pos] = idx;
                 }
             }
             __syncthreads();
@@ -238,7 +241,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
                 const auto bin       = (convert_to_uint32(raw_input) >> offset) & 0xFF;
                 if (bin > threshold_bin) {
                     const auto pos = ::atomicAdd(&s_counter, 1);
-                    index[pos]     = idx;
+                    if (pos < TopK)
+                        index[pos] = idx;
                 } else if (bin == threshold_bin) {
                     if (round == 3) {
                         const auto pos = ::atomicAdd(&s_last_remain, -1);
@@ -290,6 +294,9 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
         return naive_topk_transform_decode(score, length, dst_page_entry);
     } else {
         __shared__ int s_indices[TopK];
+        s_indices[tid]                    = -1;
+        s_indices[tid + kThreadsPerBlock] = -1;
+        __syncthreads();
         fast_topk_cuda_tl(score, s_indices, row_start, length);
         // copy src[s_indices] to dst, we manually unroll here
         static_assert(TopK % kThreadsPerBlock == 0);
@@ -341,16 +348,19 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
         return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
     } else {
         __shared__ int s_indices[TopK];
+        s_indices[tid]                    = -1;
+        s_indices[tid + kThreadsPerBlock] = -1;
+        __syncthreads();
         fast_topk_cuda_tl(score, s_indices, row_start, length);
         // copy src[s_indices] to dst, we manually unroll here
         static_assert(TopK % kThreadsPerBlock == 0);
         static_assert(TopK / kThreadsPerBlock == 2);
         const auto idx_0      = tid;
         const auto pos_0      = s_indices[idx_0];
-        dst_page_entry[idx_0] = src_page_entry[pos_0];
+        dst_page_entry[idx_0] = (pos_0 >= 0) ? src_page_entry[pos_0] : -1;
         const auto idx_1      = tid + kThreadsPerBlock;
         const auto pos_1      = s_indices[idx_1];
-        dst_page_entry[idx_1] = src_page_entry[pos_1];
+        dst_page_entry[idx_1] = (pos_1 >= 0) ? src_page_entry[pos_1] : -1;
     }
 }
 
@@ -371,6 +381,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
         return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
     } else {
         __shared__ int s_indices[TopK];
+        // Initialize to -1 so unwritten slots produce a known sentinel
+        s_indices[tid]                    = -1;
+        s_indices[tid + kThreadsPerBlock] = -1;
+        __syncthreads();
         fast_topk_cuda_tl(score, s_indices, row_start, length);
         // copy src[s_indices] to dst, we manually unroll here
         static_assert(TopK % kThreadsPerBlock == 0);
@@ -539,11 +553,27 @@ void fast_topk_transform_ragged_fused(const at::Tensor&         score,
     const auto block  = dim3{kThreadsPerBlock};
 
     setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
+
+    const auto result1 = cudaGetLastError();
+    TORCH_CHECK(result1 == cudaSuccess, "before sync1 failed:", ::cudaGetErrorString(result1));
+
+    auto sync_result1 = cudaStreamSynchronize(stream);
+    TORCH_CHECK(sync_result1 == cudaSuccess, "sync1 error: ", ::cudaGetErrorString(sync_result1));
+
+    const auto result2 = cudaGetLastError();
+    TORCH_CHECK(result2 == cudaSuccess, "after sync1 failed:", ::cudaGetErrorString(result2));
+
     topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
         params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
 
-    const auto result = cudaGetLastError();
-    TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+    const auto result3 = cudaGetLastError();
+    TORCH_CHECK(result3 == cudaSuccess, "before sync2 failed:", ::cudaGetErrorString(result3));
+
+    auto sync_result2 = cudaStreamSynchronize(stream);
+    TORCH_CHECK(sync_result2 == cudaSuccess, "sync2 error: ", ::cudaGetErrorString(sync_result2));
+
+    const auto result4 = cudaGetLastError();
+    TORCH_CHECK(result4 == cudaSuccess, "after sync2 failed:", ::cudaGetErrorString(result4));
 }
 
 }  // namespace rtp_llm
