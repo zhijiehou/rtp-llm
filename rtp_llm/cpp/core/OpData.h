@@ -152,6 +152,7 @@ struct GptModelOutputs {
     torch::Tensor all_hidden_states;
     torch::Tensor all_logits;
     torch::Tensor softmax_result;
+    torch::Tensor nan_flag;
 
     std::vector<torch::Tensor> moe_gating;
 };
