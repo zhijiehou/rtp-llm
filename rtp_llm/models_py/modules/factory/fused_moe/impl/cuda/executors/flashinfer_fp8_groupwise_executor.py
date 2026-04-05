@@ -76,7 +76,7 @@ def _recompute_float32_scales(weight_fp8: torch.Tensor) -> torch.Tensor:
 
     # Compute per-block amax
     w_view = w_padded.view(N_padded // BLOCK_SIZE, BLOCK_SIZE, K_padded // BLOCK_SIZE, BLOCK_SIZE)
-    w_amax = w_view.abs().float().amax(dim=(1, 3)).clamp(min=1e-4)
+    w_amax = w_view.float().abs().amax(dim=(1, 3)).clamp(min=1e-4)
 
     # Scale = amax / 448.0, rounded up to power-of-2 (UE8M0)
     sf = w_amax / 448.0
