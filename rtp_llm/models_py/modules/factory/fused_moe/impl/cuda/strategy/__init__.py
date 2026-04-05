@@ -24,6 +24,15 @@ from .no_quant import (
 from .fp4 import (CudaFp4EpLowLatencyStrategy,
                   CudaFp4EpNormalStrategy,
                   CudaFp4NoDPStrategy)
+from .fp8_per_tensor_sm100 import (
+    CudaFp8PerTensorSm100EpLowLatencyStrategy,
+    CudaFp8PerTensorSm100EpNormalStrategy,
+    CudaFp8PerTensorSm100NoDPStrategy,
+)
+from .fp8_per_block_sm100 import (
+    CudaFp8PerBlockSm100EpLowLatencyStrategy,
+    CudaFp8PerBlockSm100EpNormalStrategy,
+)
 
 
 __all__ = [
@@ -46,5 +55,12 @@ __all__ = [
     "CudaW4a8Int4PerChannelNoDPStrategy",
     "CudaFp4EpLowLatencyStrategy",
     "CudaFp4EpNormalStrategy",
-    "CudaFp4NoDPStrategy"
+    "CudaFp4NoDPStrategy",
+    # FP8 PerTensor SM100
+    "CudaFp8PerTensorSm100NoDPStrategy",
+    "CudaFp8PerTensorSm100EpNormalStrategy",
+    "CudaFp8PerTensorSm100EpLowLatencyStrategy",
+    # FP8 PerBlock SM100 (FlashInfer groupwise)
+    "CudaFp8PerBlockSm100EpNormalStrategy",
+    "CudaFp8PerBlockSm100EpLowLatencyStrategy",
 ]

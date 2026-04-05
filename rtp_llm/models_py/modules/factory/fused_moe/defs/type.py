@@ -30,3 +30,5 @@ class ExecutorType(Enum):
     CUTLASS_BATCHED_W4A8_INT4_PER_CHANNEL = 6  # Cutlass batched W4A8 INT4 PER CHANNEL (most optimized)
     TRTLLM_FP4 = 7  # TRTLLM FP4 executor (specialized)
     CUTEDSL_FP4 = 8  # CuteDSL FP4 executor (FP4 optimized)
+    CUTLASS_SM100_FP8 = 9  # CUTLASS SM100 FP8 executor (Blackwell optimized)
+    FLASHINFER_FP8_GROUPWISE = 10  # FlashInfer FP8 groupwise SM100 (2SM prefill)

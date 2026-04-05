@@ -14,7 +14,10 @@ from rtp_llm.models_py.utils.arch import is_cuda
 from rtp_llm.models_py.utils.math import align
 
 if is_cuda():
-    from rtp_kernel.fp8_group_gemm import fp8_grouped_gemm_ptpc
+    try:
+        from rtp_kernel.fp8_group_gemm import fp8_grouped_gemm_ptpc
+    except ImportError:
+        fp8_grouped_gemm_ptpc = None
 
     from rtp_llm.ops.compute_ops import (
         per_tensor_quant_fp8,
@@ -261,31 +264,45 @@ def cutlass_moe_mm_fp8_scaled(
             profile=True,
         )
     else:
-        fp8_grouped_gemm_ptpc(
-            output,
-            aq,
-            w,
-            aq_scale,
-            w_scale,
-            expert_offsets,
-            problem_sizes,
-            a_strides,
-            b_strides,
-            c_strides,
-            per_act_token,
-            per_out_ch,
-            tile_m=128,
-            tile_n=128,
-            tile_k=128,
-            cluster_m=1,
-            cluster_n=1,
-            cluster_k=1,
-            stage_count=0,
-            mainloop_sched=0,
-            epilogue_sched=0,
-            swap_ab=swap_ab,
-            profile=True,
-        )
+        # SM100 (B200/GB200) heuristic based on vLLM 3-config dispatch
+        sm_major = torch.cuda.get_device_capability()[0]
+        if sm_major >= 10:
+            if elements_m <= 64:
+                # Decode: small M, swap_ab=True, tile <128,16,128>
+                tile_m, tile_n, tile_k = 128, 16, 128
+                cluster_m, cluster_n, cluster_k = 1, 1, 1
+                fb_swap_ab = True
+            elif N >= 8192:
+                # Large prefill: 2SM, cluster <2,1,1>
+                tile_m, tile_n, tile_k = 128, 256, 128
+                cluster_m, cluster_n, cluster_k = 2, 1, 1
+                fb_swap_ab = False
+            else:
+                # Default: 1SM
+                tile_m, tile_n, tile_k = 128, 256, 128
+                cluster_m, cluster_n, cluster_k = 1, 1, 1
+                fb_swap_ab = False
+            fp8_grouped_gemm_ptpc(
+                output, aq, w, aq_scale, w_scale,
+                expert_offsets, problem_sizes,
+                a_strides, b_strides, c_strides,
+                per_act_token, per_out_ch,
+                tile_m, tile_n, tile_k,
+                cluster_m, cluster_n, cluster_k,
+                stage_count=0, mainloop_sched=0, epilogue_sched=0,
+                swap_ab=fb_swap_ab, profile=True,
+            )
+        else:
+            fp8_grouped_gemm_ptpc(
+                output, aq, w, aq_scale, w_scale,
+                expert_offsets, problem_sizes,
+                a_strides, b_strides, c_strides,
+                per_act_token, per_out_ch,
+                tile_m=128, tile_n=128, tile_k=128,
+                cluster_m=1, cluster_n=1, cluster_k=1,
+                stage_count=0, mainloop_sched=0, epilogue_sched=0,
+                swap_ab=swap_ab, profile=True,
+            )
 
 
 def get_best_config_swap_ab(

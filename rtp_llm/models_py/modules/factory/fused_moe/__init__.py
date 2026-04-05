@@ -91,15 +91,25 @@ else:
     registry.register(CudaW4a8Int4PerChannelEpLowLatencyStrategy())
     registry.register(CudaW4a8Int4PerChannelEpNormalStrategy())
     registry.register(CudaW4a8Int4PerChannelNoDPStrategy())
-    # Only register FP4 strategies on SM_100+ (and only if CUDA GPU is available)
+    # Only register SM100+ strategies (and only if CUDA GPU is available)
     if torch.cuda.is_available() and is_cuda() and get_sm()[0] >= 10:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
             CudaFp4EpLowLatencyStrategy,
             CudaFp4EpNormalStrategy,
             CudaFp4NoDPStrategy,
+            CudaFp8PerBlockSm100EpLowLatencyStrategy,
+            CudaFp8PerBlockSm100EpNormalStrategy,
+            CudaFp8PerTensorSm100EpLowLatencyStrategy,
+            CudaFp8PerTensorSm100EpNormalStrategy,
+            CudaFp8PerTensorSm100NoDPStrategy,
         )
 
         registry.register(CudaFp4EpLowLatencyStrategy())
         registry.register(CudaFp4EpNormalStrategy())
         registry.register(CudaFp4NoDPStrategy())
+        registry.register(CudaFp8PerTensorSm100NoDPStrategy())
+        registry.register(CudaFp8PerTensorSm100EpNormalStrategy())
+        registry.register(CudaFp8PerTensorSm100EpLowLatencyStrategy())
+        registry.register(CudaFp8PerBlockSm100EpNormalStrategy())
+        registry.register(CudaFp8PerBlockSm100EpLowLatencyStrategy())
     FusedMoeFactory.set_registry(registry)
