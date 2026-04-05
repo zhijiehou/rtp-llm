@@ -7,8 +7,13 @@ group_gemm_fp8_nt_groupwise kernel. Tests use flat 2D token layout
 
 import unittest
 
-import pytest
 import torch
+
+try:
+    import pytest
+    pytestmark = [pytest.mark.gpu(type="SM100_ARM"), pytest.mark.fp8_sm100]
+except ImportError:
+    pytest = None
 
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -23,8 +28,6 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import ExecutorType
 from rtp_llm.utils.model_weight import W
-
-pytestmark = [pytest.mark.gpu(type="SM100_ARM"), pytest.mark.fp8_sm100]
 
 BLOCK_SIZE = 128
 
