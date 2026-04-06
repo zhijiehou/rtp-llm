@@ -243,6 +243,29 @@ cc_library(
 )
 
 cc_library(
+    name = "kernels_block_zero",
+    srcs = ["block_zero_kernels.cu"],
+    hdrs = ["block_zero_kernels.h"],
+    deps = any_cuda_deps,
+    copts = any_cuda_copts(),
+    include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "block_zero_torch_op",
+    srcs = ["block_zero_torch_op.cc"],
+    hdrs = ["block_zero_torch_op.h"],
+    deps = torch_deps() + select({
+        "@//:using_cuda": [":kernels_block_zero"],
+        "@//:using_rocm": [":kernels_block_zero"],
+        "//conditions:default": [],
+    }),
+    copts = any_cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "kernels_cu",
     deps = [
         ":kernels_activation",

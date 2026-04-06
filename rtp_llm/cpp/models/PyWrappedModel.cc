@@ -210,7 +210,7 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
     RTP_LLM_PROFILE_SCOPE("py_model.callForwardPostLayers");
 
     torch::Tensor nan_flag;
-    if (inputs.kv_cache_block_id.defined() && layer_base_addr_buffer_.defined()) {
+    if (inputs.nan_check_enabled && inputs.kv_cache_block_id.defined() && layer_base_addr_buffer_.defined()) {
         int64_t batch_size = inputs.input_lengths.size(0);
         nan_flag = torch::zeros({batch_size}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
 

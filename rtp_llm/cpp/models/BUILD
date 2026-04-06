@@ -117,7 +117,23 @@ cc_library(
     ],
     deps = [
         "//:rtp_compute_ops",
-        "//rtp_llm/cpp/kernels:nan_check_torch_op",
+        "//rtp_llm/models_py/bindings/common/kernels:nan_check_torch_op",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "block_zero_runner",
+    srcs = [
+        "BlockZeroRunner.cc",
+    ],
+    hdrs = [
+        "BlockZeroRunner.h",
+    ],
+    deps = [
+        "//:rtp_compute_ops",
+        "//rtp_llm/cpp/cache:cache_group_type",
+        "//rtp_llm/models_py/bindings/common/kernels:block_zero_torch_op",
     ],
     visibility = ["//visibility:public"],
 )
@@ -131,6 +147,7 @@ cc_library(
         "*.cc",
     ], exclude = [
         "NanCheckRunner.cc",
+        "BlockZeroRunner.cc",
     ]),
     deps = [
         ":sample_infos",
@@ -138,6 +155,7 @@ cc_library(
         ":dfa_utils",
         ":context_parallel",
         ":nan_check_runner",
+        ":block_zero_runner",
         "//:rtp_compute_ops",
         "//rtp_llm/cpp/core:exec_ops_hdr",
         "//rtp_llm/cpp/engine_base/stream:complete_token_ids",

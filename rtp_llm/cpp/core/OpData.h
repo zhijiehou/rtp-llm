@@ -127,11 +127,12 @@ struct GptModelInputs {
     bool          pd_separation             = false;
     bool          decode_entrance           = false;
 
-    bool need_all_logits = false;
-    bool need_moe_gating = false;
-    bool warmup          = false;
-    bool skip_run        = false;
-    bool is_fake_stream  = false;
+    bool need_all_logits  = false;
+    bool need_moe_gating  = false;
+    bool warmup           = false;
+    bool skip_run         = false;
+    bool is_fake_stream   = false;
+    bool nan_check_enabled = false;
 
     // Linear attention target verify should write draft tokens mamba states
     // to extra kv_cache blocks when normal inference only write last token mamba state.

@@ -485,6 +485,17 @@ bool NormalEngine::isTimelineProfilingEnabled() const {
     return step_profiler_.enabled();
 }
 
+void NormalEngine::setNanCheckEnabled(bool enabled) {
+    if (executor_) {
+        executor_->setNanCheckEnabled(enabled);
+    }
+    RTP_LLM_LOG_INFO("NanCheck %s via online request", enabled ? "enabled" : "disabled");
+}
+
+bool NormalEngine::isNanCheckEnabled() const {
+    return false;
+}
+
 bool NormalEngine::isMTPEagle() {
     if (propose_params_) {
         return propose_params_->sp_type == SP_TYPE_MTP || propose_params_->sp_type == SP_TYPE_EAGLE;

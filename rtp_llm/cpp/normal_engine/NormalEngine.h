@@ -47,6 +47,8 @@ public:
     bool updateEplbConfig(const EPLBConfig& config) override;
     void startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) override;
     bool isTimelineProfilingEnabled() const override;
+    void setNanCheckEnabled(bool enabled) override;
+    bool isNanCheckEnabled() const override;
 
 private:
     void                            initScheduler();
