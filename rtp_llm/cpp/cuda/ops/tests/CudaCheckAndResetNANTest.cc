@@ -947,30 +947,29 @@ TEST_F(CudaCheckAndResetNANTest, TestFloat_KVCachePrefill_Basic) {
     size_t batch_size           = 2;
     size_t layer_num            = 20;
     size_t seq_size_per_block   = 64;
-    size_t max_blocks_per_batch = 1024 * 1024 / seq_size_per_block;
+    size_t max_blocks_per_batch = 8;  // 8 blocks * 64 tokens/block = 512 tokens max
     size_t k_token_size         = 128 * 2;
     size_t v_token_size         = 128 * 2;
     size_t element_size         = sizeof(float);
     size_t block_size_bytes     = (k_token_size + v_token_size) * seq_size_per_block * element_size;
 
     std::vector<int32_t> prefix_lengths = {64, 64};
-    std::vector<int32_t> seq_len_cu     = {(int32_t)max_blocks_per_batch, (int32_t)(max_blocks_per_batch / 2)};
+    std::vector<int32_t> seq_len_cu     = {256, 128};  // batch 0: 256 tokens (4 blocks), batch 1: 128 tokens (2 blocks)
 
-    // Block IDs: batch 0 uses blocks [0, 1], batch 1 uses blocks [2, 3]
+    // Block IDs: batch 0 uses blocks [0..7], batch 1 uses blocks [8..15]
     std::vector<std::vector<int32_t>> kv_cache_block_id = {{}, {}};
     for (size_t i = 0; i < max_blocks_per_batch; i++) {
         kv_cache_block_id[0].push_back(i);
-        if (i < max_blocks_per_batch / 2) {
-            kv_cache_block_id[1].push_back(i + max_blocks_per_batch);
-        }
+        kv_cache_block_id[1].push_back(i + max_blocks_per_batch);
     }
 
-    // Insert NaN at token 10 (batch 0, in checked range [5, 20))
-    // Insert NaN at token 5 (batch 1, before checked range [10, 30), should not be reset)
+    // Insert NaN at token 100 (batch 0, in checked range [64, 256))
+    // Insert NaN at token 50 (batch 1, before prefix_length 64, should not be reset)
+    // Insert NaN at token 100 (batch 1, in checked range [64, 128))
     std::vector<std::tuple<size_t, size_t, int32_t, bool, bool>> positions = {
         {0, 0, 100, false, true},  // batch 0, layer 0, token 100, NaN, K part
-        {1, 0, 50, false, true},  // batch 1, layer 0, token 50 (before prefix_length, should not be reset), NaN, K part
-        {1, 6, 100, false, true}  // batch 1, layer 6, token 100, NaN, K part
+        {1, 0, 50, false, true},   // batch 1, layer 0, token 50 (before prefix_length, should not be reset)
+        {1, 6, 100, false, true}   // batch 1, layer 6, token 100, NaN, K part
     };
 
     testKVCachePrefillCheckAndResetNAN<float>(batch_size,
@@ -989,28 +988,28 @@ TEST_F(CudaCheckAndResetNANTest, TestFloat_KVCachePrefill_MultiLayer) {
     size_t batch_size           = 1;
     size_t layer_num            = 100;
     size_t seq_size_per_block   = 8;
-    size_t max_blocks_per_batch = 1024 * 1024 / seq_size_per_block;
+    size_t max_blocks_per_batch = 16;  // 16 blocks * 8 tokens/block = 128 tokens max
     size_t k_token_size         = 64;
     size_t v_token_size         = 64;
     size_t element_size         = sizeof(float);
     size_t block_size_bytes     = (k_token_size + v_token_size) * seq_size_per_block * element_size;
 
-    std::vector<int32_t> prefix_lengths = {(int32_t)(1024 * 1020)};
-    std::vector<int32_t> seq_len_cu     = {(int32_t)(max_blocks_per_batch * seq_size_per_block)};
+    std::vector<int32_t> prefix_lengths = {8};   // check from token 8
+    std::vector<int32_t> seq_len_cu     = {128};  // total 128 tokens (16 blocks)
 
     std::vector<std::vector<int32_t>> kv_cache_block_id = {std::vector<int32_t>()};
     for (size_t i = 0; i < max_blocks_per_batch; i++) {
         kv_cache_block_id[0].push_back((int32_t)i);
     }
 
-    // Insert NaN at different layers, all in checked range
+    // Insert NaN at different layers, all in checked range [8, 128)
     std::vector<std::tuple<size_t, size_t, int32_t, bool, bool>> positions = {
-        {0, 0, 6, false, true},                                      // layer 0, token 6, NaN, K part
-        {0, 1, 8, false, true},                                      // layer 1, token 8, NaN, K part
-        {0, 2, 10, false, true},                                     // layer 2, token 10, NaN, K part
-        {0, 6, 1024 * 1023, false, true},                            // layer 6, token 1024*1023, NaN, K part
-        {0, 6, 1024 * 1024 - 1, true, true},                         // layer 6, token 1024*1023, Inf, K part
-        {0, 99, 1024 * 1024 - seq_size_per_block + 1, false, false}  // layer 100, last block, NaN, V part
+        {0, 0, 10, false, true},                                     // layer 0, token 10, NaN, K part
+        {0, 1, 12, false, true},                                     // layer 1, token 12, NaN, K part
+        {0, 2, 20, false, true},                                     // layer 2, token 20, NaN, K part
+        {0, 6, 100, false, true},                                    // layer 6, token 100, NaN, K part
+        {0, 6, 127, true, true},                                     // layer 6, token 127 (last), Inf, K part
+        {0, 99, 128 - seq_size_per_block + 1, false, false}          // layer 99, last block, NaN, V part
     };
 
     testKVCachePrefillCheckAndResetNAN<float>(batch_size,
@@ -1198,30 +1197,29 @@ TEST_F(CudaCheckAndResetNANTest, TestFP8_KVCachePrefill_Basic) {
     size_t batch_size           = 2;
     size_t layer_num            = 50;
     size_t seq_size_per_block   = 64;
-    size_t max_blocks_per_batch = 1024 * 1024 / seq_size_per_block;
+    size_t max_blocks_per_batch = 8;  // 8 blocks * 64 tokens/block = 512 tokens max
     size_t k_token_size         = 128 * 2;
     size_t v_token_size         = 128 * 2;
     size_t element_size         = sizeof(__nv_fp8_e4m3);
     size_t block_size_bytes     = (k_token_size + v_token_size) * seq_size_per_block * element_size;
 
     std::vector<int32_t> prefix_lengths = {64, 64};
-    std::vector<int32_t> seq_len_cu     = {(int32_t)max_blocks_per_batch, (int32_t)(max_blocks_per_batch / 2)};
+    std::vector<int32_t> seq_len_cu     = {256, 128};  // batch 0: 256 tokens, batch 1: 128 tokens
 
-    // Block IDs: batch 0 uses blocks [0, 1], batch 1 uses blocks [2, 3]
+    // Block IDs: batch 0 uses blocks [0..7], batch 1 uses blocks [8..15]
     std::vector<std::vector<int32_t>> kv_cache_block_id = {{}, {}};
     for (size_t i = 0; i < max_blocks_per_batch; i++) {
         kv_cache_block_id[0].push_back(i);
-        if (i < max_blocks_per_batch / 2) {
-            kv_cache_block_id[1].push_back(i + max_blocks_per_batch);
-        }
+        kv_cache_block_id[1].push_back(i + max_blocks_per_batch);
     }
 
-    // Insert NaN at token 10 (batch 0, in checked range [5, 20))
-    // Insert NaN at token 5 (batch 1, before checked range [10, 30), should not be reset)
+    // Insert NaN at token 100 (batch 0, in checked range [64, 256))
+    // Insert NaN at token 50 (batch 1, before prefix_length 64, should not be reset)
+    // Insert NaN at token 100 (batch 1, in checked range [64, 128))
     std::vector<std::tuple<size_t, size_t, int32_t, bool, bool>> positions = {
         {0, 0, 100, false, true},  // batch 0, layer 0, token 100, NaN, K part
-        {1, 0, 50, false, true},  // batch 1, layer 0, token 50 (before prefix_length, should not be reset), NaN, K part
-        {1, 6, 100, false, true}  // batch 1, layer 6, token 100, NaN, K part
+        {1, 0, 50, false, true},   // batch 1, layer 0, token 50 (before prefix_length, should not be reset)
+        {1, 6, 100, false, true}   // batch 1, layer 6, token 100, NaN, K part
     };
 
     testKVCachePrefillCheckAndResetNAN<__nv_fp8_e4m3>(batch_size,

@@ -41,9 +41,10 @@ void invokeCheckNAN(T* input, size_t nums, cudaStream_t stream);
  * Memory organization: All K first (organized by [head, token, head_dim]), then all V.
  *
  * For MLA (Multi-head Latent Attention) KV cache:
- * - Layout: [layer_num, block_num, seq_size_per_block, k_token_size + v_token_size + layer_out_size]
- * - Within a block: K part (kv_lora_rank), V part (rope_head_dim), then layer_out part.
- * - Memory organization: All K first, then all V, then all layer_out.
+ * - Layout: [layer_num, block_num, seq_size_per_block, kv_lora_rank + rope_head_dim]
+ * - Within a block: K part (kv_lora_rank), then V part (rope_head_dim).
+ * - For FP8 MLA, the block stride may include embedded scale factors and bf16 RoPE
+ *   expansion; block_size_bytes should be obtained from CacheConfig::kv_block_stride_bytes.
  *
  * All pointer arguments are device pointers.
  *
@@ -100,15 +101,7 @@ void invokeCheckAndResetNANKvCachePrefill(const void* const* layer_base_addr,
                                           cudaStream_t       stream);
 
 /**
- * Decode: check and reset NaN/Inf in KV cache.
- *
- * This checks only the last token for each batch, based on sequence_lengths[batch].
- *
- * For MLA (Multi-head Latent Attention) KV cache:
- * - Layout: [layer_num, block_num, seq_size_per_block, k_token_size + v_token_size + layer_out_size]
- * - Within a block: K part (kv_lora_rank), V part (rope_head_dim), then layer_out part.
- * - Memory organization: All K first, then all V, then all layer_out.
- *
+ * Decode: check and reset NaN/Inf in KV cache (last token only).
  * See invokeCheckAndResetNANKvCachePrefill() for layout and buffer contracts.
  */
 template<typename T>

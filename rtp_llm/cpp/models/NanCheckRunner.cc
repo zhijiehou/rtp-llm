@@ -38,36 +38,35 @@ bool KvCacheNanCheckRunner::run(const AttentionConfigs& attention_config,
     int64_t decoder_batch_size = inputs.sequence_lengths.defined() ? inputs.sequence_lengths.size(0) : 0;
     int64_t context_batch_size = inputs.input_lengths.size(0) - decoder_batch_size;
 
-    if (attention_config.use_mla && attention_config.is_sparse) {
-        RTP_LLM_LOG_DEBUG("skip KvCacheNanCheckRunner for sparse MLA KV layout");
+    if (attention_config.use_mla
+        && (attention_config.is_sparse
+            || cache_dtype == DataType::TYPE_FP8_E4M3 || cache_dtype == DataType::TYPE_FP8_E8M0)) {
+        RTP_LLM_LOG_DEBUG("skip KvCacheNanCheckRunner for sparse or FP8 MLA KV layout");
         return false;
     }
 
     const int64_t seq_size_per_block = attention_config.tokens_per_block;
 
-    int64_t k_block_size_bytes = 0;
-    int64_t v_block_size_bytes = 0;
-    int64_t k_token_size       = 0;
-    int64_t v_token_size       = 0;
-    int64_t local_head_num_kv  = 0;
+    int64_t k_token_size      = 0;
+    int64_t v_token_size      = 0;
+    int64_t local_head_num_kv = 0;
 
     if (attention_config.use_mla) {
-        k_token_size       = attention_config.kv_lora_rank;
-        v_token_size       = attention_config.rope_head_dim;
-        local_head_num_kv  = 1;
-        k_block_size_bytes = local_head_num_kv * k_token_size * seq_size_per_block * cache_element_size;
-        v_block_size_bytes = local_head_num_kv * v_token_size * seq_size_per_block * cache_element_size;
+        k_token_size      = attention_config.kv_lora_rank;
+        v_token_size      = attention_config.rope_head_dim;
+        local_head_num_kv = 1;
     } else {
-        k_token_size       = attention_config.size_per_head;
-        v_token_size       = attention_config.size_per_head;
-        local_head_num_kv  = attention_config.kv_head_num;
-        k_block_size_bytes = local_head_num_kv * k_token_size * seq_size_per_block * cache_element_size;
-        v_block_size_bytes = local_head_num_kv * v_token_size * seq_size_per_block * cache_element_size;
+        k_token_size      = attention_config.size_per_head;
+        v_token_size      = attention_config.size_per_head;
+        local_head_num_kv = attention_config.kv_head_num;
     }
 
-    const int64_t k_token_bytes    = k_token_size * cache_element_size;
-    const int64_t v_token_bytes    = v_token_size * cache_element_size;
-    const int64_t block_size_bytes = k_block_size_bytes + v_block_size_bytes;
+    const int64_t k_block_size_bytes = local_head_num_kv * k_token_size * seq_size_per_block * cache_element_size;
+    const int64_t v_block_size_bytes = local_head_num_kv * v_token_size * seq_size_per_block * cache_element_size;
+    const int64_t k_token_bytes      = k_token_size * cache_element_size;
+    const int64_t v_token_bytes      = v_token_size * cache_element_size;
+    // Use CacheConfig stride directly; for FP8 MLA it includes embedded scales that K+V alone miss.
+    const int64_t block_size_bytes   = static_cast<int64_t>(inputs.kv_block_stride_bytes);
 
     if (!layer_base_addr_buffer.defined() || layer_base_addr_buffer.size(0) != static_cast<int64_t>(layer_num)) {
         RTP_LLM_LOG_WARNING("KvCacheNanCheckRunner: layer_base_addr_buffer invalid. Expected %zu, got %ld",

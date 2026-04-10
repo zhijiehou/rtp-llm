@@ -211,17 +211,7 @@ struct NanInfChecker<__nv_fp8_e4m3> {
 #endif
 
 // KV cache NaN/Inf check/reset kernel for prefill.
-//
-// Layout: [layer_num, block_num, 2, local_head_num_kv, seq_size_per_block, k_token_size]
-// Within a block: [2, local_head_num_kv, seq_size_per_block, k_token_size]
-// Memory organization: All K first (organized by [head, token, head_dim]), then all V.
-//
-// For MLA (Multi-head Latent Attention) KV cache:
-// - Layout: [layer_num, block_num, seq_size_per_block, k_token_size + v_token_size + layer_out_size]
-// - Within a block: K part (kv_lora_rank), V part (rope_head_dim), then layer_out part.
-// - Memory organization: All K first, then all V, then all layer_out.
-// See invokeCheckAndResetNANKvCachePrefill() in nan_check_kernels.h for detailed documentation.
-// CacheGroupType convention: 0 = LINEAR (skip), 1 = FULL (check).
+// See nan_check_kernels.h for layout and buffer contracts.
 template<typename T>
 __global__ void check_and_reset_kv_cache_prefill_kernel(const void* const* __restrict__ layer_base_addr,
                                                         const int32_t* __restrict__ kv_cache_block_id,
@@ -280,13 +270,9 @@ __global__ void check_and_reset_kv_cache_prefill_kernel(const void* const* __res
     extern __shared__ char shared_mem[];
     int32_t*               shared_block_ids = reinterpret_cast<int32_t*>(shared_mem);
     int32_t*               shared_nan_flags = &shared_block_ids[num_warps];
-    int32_t*               shared_nan_flag  = &shared_nan_flags[num_warps];
 
     if (lane_id == 0) {
         shared_nan_flags[warp_id] = 0;
-    }
-    if (threadIdx.x == 0) {
-        *shared_nan_flag = 0;
     }
     __syncthreads();
 
@@ -403,18 +389,7 @@ __global__ void check_and_reset_kv_cache_prefill_kernel(const void* const* __res
 }
 
 // KV cache NaN/Inf check/reset kernel for decode (last token only).
-//
-// This checks only the last token for each batch, based on sequence_lengths[batch].
-//
-// Layout: [layer_num, block_num, 2, local_head_num_kv, seq_size_per_block, k_token_size]
-// Within a block: [2, local_head_num_kv, seq_size_per_block, k_token_size]
-// Memory organization: All K first (organized by [head, token, head_dim]), then all V.
-//
-// For MLA (Multi-head Latent Attention) KV cache:
-// - Layout: [layer_num, block_num, seq_size_per_block, k_token_size + v_token_size + layer_out_size]
-// - Within a block: K part (kv_lora_rank), V part (rope_head_dim), then layer_out part.
-// - Memory organization: All K first, then all V, then all layer_out.
-// See invokeCheckAndResetNANKvCacheDecode() in nan_check_kernels.h for detailed documentation.
+// See nan_check_kernels.h for layout and buffer contracts.
 template<typename T>
 __global__ void check_and_reset_kv_cache_decode_kernel(const void* const* __restrict__ layer_base_addr,
                                                        const int32_t* __restrict__ kv_cache_block_id,
@@ -580,7 +555,7 @@ void invokeCheckAndResetNANKvCachePrefill(const void* const* layer_base_addr,
 
     const size_t threads_per_block = 256;
     const size_t warps_per_block   = threads_per_block / 32;
-    const size_t shared_mem_size   = warps_per_block * sizeof(int32_t) * 2 + sizeof(int32_t);
+    const size_t shared_mem_size   = warps_per_block * sizeof(int32_t) * 2;
 
     dim3 grid(batch_size, layer_num);
     dim3 block(threads_per_block);

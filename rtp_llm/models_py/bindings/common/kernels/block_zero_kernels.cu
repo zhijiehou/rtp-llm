@@ -71,7 +71,7 @@ __device__ __forceinline__ char* get_block_dst(
         kv_cache_block_id[group_idx * batch_dim * max_blocks_per_batch
                           + batch_idx * max_blocks_per_batch
                           + last_block_index];
-    if (block_id <= 0)
+    if (block_id <= 0)  // block 0 is reserved (never allocated); -1 is NULL_BLOCK_IDX
         return nullptr;
 
     return static_cast<char*>(const_cast<void*>(base))
