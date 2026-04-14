@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:whale.online.alibaba-inc.com)",
+      "Bash(curl -s -m 5 -X POST http://33.240.43.186:8088/start_profile -H 'Content-Type: application/json' -d '{\"trace_name\":\"test_profile\", \"start_step\": 0, \"num_steps\": 3}')",
+      "Bash(echo \"CURL_FAILED: $?\")",
+      "WebFetch(domain:dash.themis.alibaba-inc.com)",
+      "WebFetch(domain:open.aone.alibaba-inc.com)"
+    ],
+    "additionalDirectories": [
+      "/home/luoli.hn/work/RTP-LLM/github-opensource/main/.claude",
+      "/home/luoli.hn/work/RTP-LLM/internal_source/.claude"
+    ]
+  }
+}
