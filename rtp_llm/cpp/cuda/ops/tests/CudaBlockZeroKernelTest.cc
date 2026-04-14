@@ -1,6 +1,6 @@
 #include "rtp_llm/cpp/cuda/ops/tests/CudaTestUtils.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
-#include "rtp_llm/cpp/kernels/block_zero_kernels.h"
+#include "rtp_llm/models_py/bindings/common/kernels/block_zero_kernels.h"
 #include <cuda_runtime.h>
 #include <vector>
 

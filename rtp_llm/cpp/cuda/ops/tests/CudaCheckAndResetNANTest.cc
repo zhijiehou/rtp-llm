@@ -1,6 +1,6 @@
 #include "rtp_llm/cpp/cuda/ops/tests/CudaTestUtils.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
-#include "rtp_llm/cpp/kernels/nan_check_kernels.h"
+#include "rtp_llm/models_py/bindings/common/kernels/nan_check_kernels.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #ifdef ENABLE_BF16

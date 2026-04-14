@@ -1,6 +1,6 @@
 #include "rtp_llm/cpp/models/NanCheckRunner.h"
 
-#include "rtp_llm/cpp/kernels/nan_check_torch_op.h"
+#include "rtp_llm/models_py/bindings/common/kernels/nan_check_torch_op.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 
 namespace rtp_llm {

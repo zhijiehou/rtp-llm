@@ -1,6 +1,6 @@
 #include "rtp_llm/models_py/bindings/cuda/CheckAndResetNanKvCacheOp.h"
 
-#include "rtp_llm/cpp/kernels/nan_check_torch_op.h"
+#include "rtp_llm/models_py/bindings/common/kernels/nan_check_torch_op.h"
 
 namespace rtp_llm {
 
