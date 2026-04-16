@@ -299,6 +299,7 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
                             py_model_outputs.size(),
                             input_list.size());
     if (!inputs.warmup && inputs.pd_separation) {
+        py::gil_scoped_release gil_release;
         cache_store_async_writer_->waitAllDone();
     }
 
@@ -342,7 +343,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
     DevicePerfWrapper wrapper(enable_device_perf_, "py model forward");
     holdInputsHostBuffers(inputs);
-    py::gil_scoped_acquire gil;
+
     try {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
 
@@ -395,6 +396,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
             hidden_states = py_model_outputs.hidden_states.clone();
         } else {
+            py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
             DevicePerfWrapper wrapper(enable_device_perf_, "normal forward");
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
