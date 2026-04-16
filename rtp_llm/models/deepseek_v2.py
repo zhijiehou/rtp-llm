@@ -463,6 +463,10 @@ class DeepSeekV2Weight(ModelDeployWeightInfo):
     def _create_rope_w(self) -> Optional[AtomicWeight]:
         if self.model_config.mla_ops_type == MlaOpsType.MHA:
             return None
+        from rtp_llm.ops import RopeStyle
+
+        if self.model_config.attn_config.rope_config.style == RopeStyle.No:
+            return None
         config = self.model_config
 
         def __create_rope_w(ts: List[torch.Tensor], config: ModelConfig):

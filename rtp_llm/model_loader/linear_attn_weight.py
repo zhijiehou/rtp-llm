@@ -161,6 +161,56 @@ def sp_id(
     return t
 
 
+# KDA split: qkv layout [hidden, num_k*dim + num_k*dim + num_v*dim]
+def split_kda_qkv(
+    t: torch.Tensor, load_config: LoadConfig, linear_config: LinearAttnConfig
+) -> torch.Tensor:
+    q_size = linear_config.linear_num_key_heads * linear_config.linear_key_head_dim
+    k_size = linear_config.linear_num_key_heads * linear_config.linear_key_head_dim
+    v_size = linear_config.linear_num_value_heads * linear_config.linear_value_head_dim
+    q, k, v = torch.split(t, [q_size, k_size, v_size], dim=1)
+    q = q.split(q.shape[1] // load_config.tp_size, dim=1)[
+        load_config.tp_rank
+    ].contiguous()
+    k = k.split(k.shape[1] // load_config.tp_size, dim=1)[
+        load_config.tp_rank
+    ].contiguous()
+    v = v.split(v.shape[1] // load_config.tp_size, dim=1)[
+        load_config.tp_rank
+    ].contiguous()
+    return torch.cat([q, k, v], dim=1)
+
+
+# KDA split: b layout [hidden, num_heads] -> [hidden, local_num_heads]
+def split_kda_b(
+    t: torch.Tensor, load_config: LoadConfig, linear_config: LinearAttnConfig
+) -> torch.Tensor:
+    return t.split(t.shape[1] // load_config.tp_size, dim=1)[
+        load_config.tp_rank
+    ].contiguous()
+
+
+# KDA split: LoRA up proj layout [lora_rank, num_heads * head_dim] -> [lora_rank, local_heads * head_dim]
+def split_kda_lora_b(
+    t: torch.Tensor, load_config: LoadConfig, linear_config: LinearAttnConfig
+) -> torch.Tensor:
+    return t.split(t.shape[1] // load_config.tp_size, dim=1)[
+        load_config.tp_rank
+    ].contiguous()
+
+
+# KDA split: dt_bias layout [num_heads * head_dim] -> [local_heads * head_dim]
+def split_kda_dt_bias(
+    t: torch.Tensor, load_config: LoadConfig, linear_config: LinearAttnConfig
+) -> torch.Tensor:
+    num_heads = linear_config.linear_num_value_heads
+    head_dim = linear_config.linear_key_head_dim
+    local_heads = num_heads // load_config.tp_size
+    t = t.reshape(num_heads, head_dim)
+    start = local_heads * load_config.tp_rank
+    return t[start : start + local_heads].reshape(-1)
+
+
 _linear_attn_split_stratey = {
     W.linear_attn_qkvz_w: split_qkvz,
     W.linear_attn_ba_w: split_ba,
@@ -169,6 +219,13 @@ _linear_attn_split_stratey = {
     W.linear_attn_conv1d_w: split_conv1d,
     W.linear_attn_out_w: split_out_linear,
     W.linear_attn_norm_w: sp_id,
+    # KDA-specific splits
+    W.linear_attn_qkv_w: split_kda_qkv,
+    W.linear_attn_b_w: split_kda_b,
+    W.linear_attn_f_a_w: sp_id,
+    W.linear_attn_f_b_w: split_kda_lora_b,
+    W.linear_attn_g_a_w: sp_id,
+    W.linear_attn_g_b_w: split_kda_lora_b,
 }
 
 

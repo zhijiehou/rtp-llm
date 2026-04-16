@@ -26,6 +26,10 @@ int HybridConfigCreator::calculateGroupLayerNum(int linear_layer_count, int full
     int group_layer_num = 0;
     if (linear_layer_count > 0 && full_layer_count > 0) {
         group_layer_num = std::gcd(linear_layer_count, full_layer_count);
+        // eg. kimi linear (7 linear_layer and 20 full_layer)
+        if (group_layer_num == 1) {
+            group_layer_num = std::min(linear_layer_count, full_layer_count);
+        }
     } else {
         group_layer_num = std::max(linear_layer_count, full_layer_count);
     }
