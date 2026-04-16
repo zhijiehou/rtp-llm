@@ -95,6 +95,11 @@ message GenerateConfigPB {
     bool enable_memory_cache = 51;
     bool enable_device_cache = 52;
     bool enable_remote_cache = 53;
+    google.protobuf.StringValue json_schema = 54;
+    google.protobuf.StringValue regex = 55;
+    google.protobuf.StringValue ebnf = 56;
+    google.protobuf.StringValue structural_tag = 57;
+    google.protobuf.StringValue response_format = 58;
 }
 
 message MMPreprocessConfigPB {

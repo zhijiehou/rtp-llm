@@ -401,6 +401,7 @@ SamplerInputs NormalBatchStreamProcessor::allocateSamplerInputs(const StreamGrou
     sampler_inputs.token_ids = device_->allocateBuffer(
         {rtp_llm::DataType::TYPE_INT32, {total_batch_size_in, sampler_inputs.step + 1}, rtp_llm::AllocationType::HOST},
         {});
+    sampler_inputs.grammar_objs.resize(total_batch_size_in, py::none());
     sampler_inputs.generator.resize(total_batch_size_in);
     return sampler_inputs;
 }
@@ -455,7 +456,8 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
                 top_p[batch_idx]       = 1;
                 temperature[batch_idx] = 1;
             }
-            no_repeat_ngram_size[batch_idx]     = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
+            no_repeat_ngram_size[batch_idx]      = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
+            sampler_inputs.grammar_objs[batch_idx] = stream->grammarObject();
             sampler_inputs.generator[batch_idx] = stream->getGenerator();
             batch_idx += 1;
         }

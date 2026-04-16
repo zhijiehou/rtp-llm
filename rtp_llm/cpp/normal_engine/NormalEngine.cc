@@ -109,7 +109,8 @@ void NormalEngine::initExecutor(const EngineInitParams&                        p
 void NormalEngine::initScheduler() {
     if (runtime_config.use_batch_decode_scheduler) {
         scheduler_.reset(
-            new BatchDecodeScheduler(runtime_config, resource_context_.cache_manager, metrics_reporter_, device_));
+            new BatchDecodeScheduler(
+                runtime_config, resource_context_.cache_manager, grammar_backend_, metrics_reporter_, device_));
         RTP_LLM_LOG_INFO("create batch decode scheduler done");
     } else if (runtime_config.use_gather_batch_scheduler) {
         scheduler_.reset(new GatherBatchScheduler(runtime_config,
@@ -118,7 +119,9 @@ void NormalEngine::initScheduler() {
                                                   parallelism_config,
                                                   model_specific_config,
                                                   resource_context_.cache_manager,
-                                                  metrics_reporter_));
+                                                  grammar_backend_,
+                                                  metrics_reporter_,
+                                                  1));
         RTP_LLM_LOG_INFO("create gather batch scheduler done");
     } else {
         scheduler_.reset(new FIFOScheduler(runtime_config,
@@ -127,7 +130,9 @@ void NormalEngine::initScheduler() {
                                            parallelism_config,
                                            model_specific_config,
                                            resource_context_.cache_manager,
-                                           metrics_reporter_));
+                                           grammar_backend_,
+                                           metrics_reporter_,
+                                           1));
         RTP_LLM_LOG_INFO("create fifo scheduler done");
     }
 }

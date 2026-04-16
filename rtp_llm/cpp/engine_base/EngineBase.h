@@ -11,6 +11,7 @@
 #include "rtp_llm/cpp/models/lora/LoraManager.h"
 #include "rtp_llm/cpp/devices/DeviceBase.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/NormalCacheStore.h"
+#include <pybind11/pybind11.h>
 
 namespace rtp_llm {
 
@@ -116,6 +117,7 @@ protected:
     rtp_llm::DeviceBase*               device_;
     ResourceContext                    resource_context_;
     std::shared_ptr<lora::LoraManager> lora_manager_;
+    py::object                         grammar_backend_ = py::none();
     std::unique_ptr<SchedulerBase>     scheduler_ = nullptr;
     bool                               pause_     = false;
 };

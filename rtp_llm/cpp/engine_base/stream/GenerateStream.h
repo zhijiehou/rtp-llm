@@ -11,6 +11,8 @@
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
 #include "rtp_llm/cpp/models/position_ids/PositionIdsGenerator.h"
+#include <pybind11/pybind11.h>
+#include <cstdint>
 #include <iterator>
 #include <mutex>
 
@@ -100,6 +102,15 @@ public:
                    size_t                                extra_reserve_token_num = 0,
                    bool                                  pert_test               = false);
     virtual ~GenerateStream() {
+        // py::object DECREF must happen under GIL.
+        try {
+            py::gil_scoped_acquire acquire;
+            grammar_obj_        = py::none();
+            grammar_future_     = py::none();
+            grammar_key_        = py::tuple();
+            grammar_wait_count_ = 0;
+        } catch (...) {
+        }
         reportMetric();
         releaseResource();
         stream_magic_ = 0;
@@ -427,6 +438,22 @@ public:
         return generator_;
     }
 
+    void setGrammarObject(const py::object& grammar);
+    py::object grammarObject() const;
+    bool hasGrammarObject() const;
+    void clearGrammarObject();
+    void setGrammarFuture(const py::object& grammar_future);
+    py::object grammarFuture() const;
+    bool hasGrammarFuture() const;
+    void clearGrammarFuture();
+    void setGrammarKey(const py::tuple& grammar_key);
+    py::tuple grammarKey() const;
+    bool hasGrammarKey() const;
+    void clearGrammarKey();
+    void resetGrammarWaitCount();
+    void incGrammarWaitCount();
+    int32_t grammarWaitCount() const;
+
     rtp_llm::BufferPtr getProposeTokens() const {
         if (propose_stream_ && propose_stream_->sp_output_buffer_->tokens > 0) {
             return propose_stream_->sp_output_buffer_->tokens;
@@ -580,6 +607,10 @@ protected:
 
     std::vector<BaseLogitsProcessorPtr> logits_processor_list_;
     at::Generator                       generator_;
+    py::object                          grammar_obj_;
+    py::object                          grammar_future_;
+    py::object                          grammar_key_;
+    int32_t                             grammar_wait_count_ = 0;
 
     // just for bool test
     bool perf_test_ = false;

@@ -14,15 +14,24 @@ struct GatherBatchSchedulerConfigLocal: public autil::legacy::Jsonizable {
 // Currently it is only used in CI with prompt_batch input, which may occur unstable result
 class GatherBatchScheduler: virtual public FIFOScheduler {
 public:
-    explicit GatherBatchScheduler(const RuntimeConfig&                 runtime_config,
-                                  const ModelConfig&                   model_config,
-                                  const PDSepConfig&                  pd_sep_config,
-                                  const ParallelismConfig&            parallelism_config,
-                                  const ModelSpecificConfig&          model_specific_config,
+    explicit GatherBatchScheduler(const RuntimeConfig&                   runtime_config,
+                                  const ModelConfig&                     model_config,
+                                  const PDSepConfig&                     pd_sep_config,
+                                  const ParallelismConfig&               parallelism_config,
+                                  const ModelSpecificConfig&             model_specific_config,
                                   const std::shared_ptr<KVCacheManager>& cache_manager,
-                                  const kmonitor::MetricsReporterPtr   metrics_reporter,
-                                  const int                            max_score_len = 1):
-        FIFOScheduler(runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, metrics_reporter, max_score_len) {
+                                  py::object                             grammar_backend,
+                                  const kmonitor::MetricsReporterPtr     metrics_reporter,
+                                  const int                              max_score_len = 1):
+        FIFOScheduler(runtime_config,
+                      model_config,
+                      pd_sep_config,
+                      parallelism_config,
+                      model_specific_config,
+                      cache_manager,
+                      grammar_backend,
+                      metrics_reporter,
+                      max_score_len) {
         RTP_LLM_LOG_INFO("GatherBatchScheduler init");
         gather_batch_size_ = 1;
     }

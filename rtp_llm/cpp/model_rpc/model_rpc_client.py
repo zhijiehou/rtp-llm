@@ -1,6 +1,7 @@
 import functools
+import json
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Mapping, Union
 
 import grpc
 from grpc import StatusCode
@@ -26,6 +27,15 @@ from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 from rtp_llm.utils.grpc_util import trans_option, trans_option_cast, trans_tensor
 
 MAX_GRPC_TIMEOUT_SECONDS = 3600
+
+_JSON_PB_KW = {"ensure_ascii": False, "separators": (",", ":")}
+
+
+def _pb_string_value_for_json_field(value: Union[str, Mapping[str, Any]]) -> str:
+    """Protobuf StringValue fields expect a string; GenerateConfig may use dict (e.g. OpenAI response_format)."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, **_JSON_PB_KW)
 
 
 class StreamState:
@@ -89,6 +99,13 @@ def trans_input(input_py: GenerateInput):
     trans_option(generate_config_pb, input_py.generate_config, "top_p_decay")
     trans_option(generate_config_pb, input_py.generate_config, "top_p_min")
     trans_option(generate_config_pb, input_py.generate_config, "top_p_reset_ids")
+    if input_py.generate_config.response_format:
+        generate_config_pb.response_format.value = _pb_string_value_for_json_field(
+            input_py.generate_config.response_format
+        )
+    trans_option(generate_config_pb, input_py.generate_config, "regex")
+    trans_option(generate_config_pb, input_py.generate_config, "ebnf")
+    trans_option(generate_config_pb, input_py.generate_config, "structural_tag")
     trans_option(generate_config_pb, input_py.generate_config, "adapter_name")
     trans_option_cast(
         generate_config_pb, input_py.generate_config, "task_id", functools.partial(str)

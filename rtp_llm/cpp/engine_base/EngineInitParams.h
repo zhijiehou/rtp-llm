@@ -116,6 +116,7 @@ struct EngineInitParams {
     py::object                   py_eplb;
     py::object                   py_sp_model;
     py::object                   weight_manager;
+    py::object                   grammar_backend = py::none();
     kmonitor::MetricsReporterPtr metrics_reporter = nullptr;
 
 public:

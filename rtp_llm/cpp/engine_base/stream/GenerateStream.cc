@@ -491,6 +491,13 @@ void GenerateStream::setStopWithoutLock(ErrorCode error_code, const std::string&
                         cost_time_ms);
     generate_status_->status     = StreamState::STOPPED;
     generate_status_->error_info = ErrorInfo(error_code, error_msg);
+    {
+        py::gil_scoped_acquire acquire;
+        grammar_obj_        = py::none();
+        grammar_future_     = py::none();
+        grammar_key_        = py::none();
+        grammar_wait_count_ = 0;
+    }
     cv_->notify_one();
 }
 
@@ -537,6 +544,13 @@ bool GenerateStream::setRunning() {
 void GenerateStream::setFinishedWithoutLock() {
     generate_status_->status = StreamState::FINISHED;
     fillSubGenerateStatus(StreamState::FINISHED);
+    {
+        py::gil_scoped_acquire acquire;
+        grammar_obj_        = py::none();
+        grammar_future_     = py::none();
+        grammar_key_        = py::none();
+        grammar_wait_count_ = 0;
+    }
     cv_->notify_one();
 }
 
@@ -1035,6 +1049,114 @@ int GenerateStream::reuseBlockSize() const {
     int reuse_length       = reuseLength();
     int seq_size_per_block = seqSizePerBlock();
     return reuse_length / seq_size_per_block;
+}
+
+void GenerateStream::setGrammarObject(const py::object& grammar) {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_obj_ = grammar;
+}
+
+py::object GenerateStream::grammarObject() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_obj_) {
+        return py::none();
+    }
+    return grammar_obj_;
+}
+
+bool GenerateStream::hasGrammarObject() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_obj_) {
+        return false;
+    }
+    return !grammar_obj_.is_none();
+}
+
+void GenerateStream::clearGrammarObject() {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_obj_ = py::none();
+}
+
+void GenerateStream::setGrammarFuture(const py::object& grammar_future) {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_future_ = grammar_future;
+}
+
+py::object GenerateStream::grammarFuture() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_future_) {
+        return py::none();
+    }
+    return grammar_future_;
+}
+
+bool GenerateStream::hasGrammarFuture() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_future_) {
+        return false;
+    }
+    return !grammar_future_.is_none();
+}
+
+void GenerateStream::clearGrammarFuture() {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_future_ = py::none();
+}
+
+void GenerateStream::setGrammarKey(const py::tuple& grammar_key) {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_key_ = grammar_key;
+}
+
+py::tuple GenerateStream::grammarKey() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_key_) {
+        return py::tuple();
+    }
+    if (grammar_key_.is_none()) {
+        return py::tuple();
+    }
+    return grammar_key_.cast<py::tuple>();
+}
+
+bool GenerateStream::hasGrammarKey() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_key_) {
+        return false;
+    }
+    return !grammar_key_.is_none();
+}
+
+void GenerateStream::clearGrammarKey() {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_key_ = py::none();
+}
+
+void GenerateStream::resetGrammarWaitCount() {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    grammar_wait_count_ = 0;
+}
+
+void GenerateStream::incGrammarWaitCount() {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    ++grammar_wait_count_;
+}
+
+int32_t GenerateStream::grammarWaitCount() const {
+    std::lock_guard<std::mutex> lock(*output_mutex_);
+    return grammar_wait_count_;
 }
 
 void GenerateStream::setSeqLength(int seq_length) {

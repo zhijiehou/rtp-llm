@@ -22,7 +22,8 @@ public:
               py::object vit_config,
               py::object mm_process_engine,
               py::object propose_model,
-              py::object token_processor);
+              py::object token_processor,
+              py::object grammar_backend);
     void stop();
     void startHttpServer(py::object model_weights_loader,
                          py::object lora_infos,
@@ -39,7 +40,7 @@ private:
                            py::object                                    mm_process_engine,
                            std::unique_ptr<ProposeModelEngineInitParams> propose_params,
                            py::object                                    token_processor);
-    EngineInitParams initModel(py::object model, py::object engine_config, py::object vit_config);
+    EngineInitParams initModel(py::object model, py::object engine_config, py::object vit_config, py::object grammar_backend);
     std::unique_ptr<ProposeModelEngineInitParams> initProposeModel(py::object              propose_model,
                                                                    const EngineInitParams& base_params);
     void                                          initRPCServer(const EngineInitParams                        maga_init_params,

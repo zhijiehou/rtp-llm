@@ -18,6 +18,7 @@ class RtpLLMOp:
         mm_engine: Optional[MMProcessEngine] = None,
         propose_model: Optional[ProposeModel] = None,
         token_processor: Optional[TokenProcessor] = None,
+        grammar_backend=None,
     ):
         self.engine_config = engine_config
         self.model = model
@@ -25,6 +26,7 @@ class RtpLLMOp:
         self.propose_model = propose_model
         self.ft_op = CppRtpLLMOp()
         self.token_processor = token_processor
+        self.grammar_backend = grammar_backend
 
     def start(self):
         self.weight = self.model.weight
@@ -36,6 +38,7 @@ class RtpLLMOp:
             self.mm_engine,
             self.propose_model,
             self.token_processor,
+            self.grammar_backend,
         )
 
     def stop(self):

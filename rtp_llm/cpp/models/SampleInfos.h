@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/core/Types.h"
 #include "rtp_llm/cpp/devices/DeviceBase.h"
 #include "rtp_llm/cpp/devices/OpData.h"
+#include <pybind11/pybind11.h>
 
 namespace rtp_llm {
 
@@ -39,6 +40,8 @@ public:
     LogitsProcessorStatesPtr logits_processor_states_ptr;
 
     size_t vocab_size;
+    // Original tokenizer/model vocab size (non-padded).
+    size_t origin_vocab_size = 0;
     size_t step;  // typically largest sequence length in the batch
 
     size_t             batch_size;            // sum of all num_beams_in of all streams
@@ -57,6 +60,9 @@ public:
 
     mutable rtp_llm::BufferPtr cum_log_probs;  // shape: [batch_size]
     mutable rtp_llm::BufferPtr all_probs;      // shape: [batch_size, vocab_size]
+
+    // Request-scoped grammar objects aligned with sampler batch rows.
+    std::vector<py::object> grammar_objs;
 
     std::vector<at::Generator> generator;
 };

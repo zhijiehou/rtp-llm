@@ -10,6 +10,7 @@ namespace rtp_llm {
 EngineBase::EngineBase(const EngineInitParams& params) {
     initDevices(params);
     lora_manager_ = std::make_shared<lora::LoraManager>(params.model_specific_config.max_lora_model_size);
+    grammar_backend_ = params.grammar_backend;
 }
 
 EngineBase::~EngineBase() {}
