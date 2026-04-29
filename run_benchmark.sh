@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /root/yiyin/yiyin_rtp_llm_mi355x_benchmark/rtp-llm
+cd /root/hzj/hzj_docker_new/rtp-llm
 
 SOURCE_DIR="$(pwd)"
 
@@ -73,7 +73,7 @@ export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
 export HACK_LAYER_NUM=5
 export FAKE_BALANCE_EXPERT=1
 export GEN_TIMELINE_SYNC=1
-export INPUT_LEN_LIST="[2048]"
+export INPUT_LEN_LIST="[16]"
 export BATCH_SIZE_LIST="[128]"
 export IS_DECODE=1
 export DECODE_TEST_LENGTH=20

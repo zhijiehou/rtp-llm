@@ -166,7 +166,7 @@ class BatchPerfImpl(object):
         # When GEN_TIMELINE_SYNC=1, send StartProfile gRPC directly to all ranks so
         # every tp_rank captures a timeline (not just rank-0 via the HTTP gen_timeline path).
         if self.profile_all_ranks:
-            self._start_profile_on_all_ranks(num_steps=2)
+            self._start_profile_on_all_ranks(num_steps=5)
         _ = self._curl_server()
         logging.info(f"finished dump profile json")
         return results

@@ -396,7 +396,7 @@ if __name__ == "__main__":
     retry_interval = 0.5
     retry_times = 3
     check_interval = 3
-    check_connection_timeout = 10
+    check_connection_timeout = 60
     heartbeat_interval = 10
 
     os.environ["MAGA_SERVER_WORK_DIR"] = os.getcwd()
