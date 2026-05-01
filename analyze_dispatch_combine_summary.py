@@ -44,28 +44,34 @@ def main():
         return dict(n=n, min=s[0], p50=s[n//2], mean=sum(s)/n,
                     p99=s[int(n*0.99)], max=s[-1])
 
-    def fmt(s):
-        if s is None: return "  (no samples)"
-        return (f"n={s['n']:>3} min={s['min']:6.1f} p50={s['p50']:6.1f} "
-                f"mean={s['mean']:6.2f} p99={s['p99']:6.1f} max={s['max']:6.1f}")
+    def row(s):
+        if s is None:
+            return f"{'-':>4} {'-':>6} {'-':>6} {'-':>6} {'-':>6} {'-':>6}"
+        return (f"{s['n']:>4} {s['min']:>6.1f} {s['p50']:>6.1f} "
+                f"{s['mean']:>6.2f} {s['p99']:>6.1f} {s['max']:>6.1f}")
+
+    col_hdr = f"{'n':>4} {'min':>6} {'p50':>6} {'mean':>6} {'p99':>6} {'max':>6}"
+    col_w = len(col_hdr)
+    sep = "-" * (4 + 3 + col_w + 3 + col_w)
 
     print(f"=== {label} ===\n")
-
-    print("Per-rank breakdown:")
-    print(f"  {'rank':>4} | {'dispatch':>55} | {'combine(>12us)':>55}")
+    print("Per-rank breakdown (us):")
+    print(f"{'':>4} | {'dispatch':^{col_w}} | {'combine (>12us)':^{col_w}}")
+    print(f"{'rank':>4} | {col_hdr} | {col_hdr}")
+    print(sep)
     for r in sorted(per_rank):
         d_s = stats(per_rank[r]["dispatch"])
         c_s = stats(per_rank[r]["combine"])
-        print(f"   {r:>2}   | {fmt(d_s):>55} | {fmt(c_s):>55}")
+        print(f"{r:>4} | {row(d_s)} | {row(c_s)}")
+    print(sep)
 
-    print("\nAggregate:")
     all_d = sum((per_rank[r]["dispatch"] for r in per_rank), [])
     all_c = sum((per_rank[r]["combine"] for r in per_rank), [])
     all_a = sum((per_rank[r]["allreduce"] for r in per_rank), [])
-    print(f"     dispatch_kernel: {fmt(stats(all_d))}")
-    print(f"  combine_kernel(real): {fmt(stats(all_c))}")
+    print(f"{'ALL':>4} | {row(stats(all_d))} | {row(stats(all_c))}")
+
     if all_a:
-        print(f"   all_reduce_kernel: {fmt(stats(all_a))}")
+        print(f"\nall_reduce_kernel (us): {row(stats(all_a))}")
 
 
 if __name__ == "__main__":
