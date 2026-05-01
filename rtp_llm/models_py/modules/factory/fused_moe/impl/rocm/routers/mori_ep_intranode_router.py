@@ -35,6 +35,10 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 
+from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm.routers.mori_ep_timing_recorder import (
+    MoriEpTimingRecorder,
+)
+
 
 class MoriEpIntranodeRouter(FusedMoeDataRouter):
     @classmethod
@@ -81,6 +85,20 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
     def _get_max_inp_tokens(self) -> int:
         return self.mori_buffer_wrapper.config.max_num_inp_token_per_rank
 
+    def _timed_dispatch(self, *args):
+        rec = MoriEpTimingRecorder.get()
+        if rec is None:
+            return self.mori_buffer_wrapper.op.dispatch(*args)
+        with rec.record("dispatch"):
+            return self.mori_buffer_wrapper.op.dispatch(*args)
+
+    def _timed_combine(self, *args):
+        rec = MoriEpTimingRecorder.get()
+        if rec is None:
+            return self.mori_buffer_wrapper.op.combine(*args)
+        with rec.record("combine"):
+            return self.mori_buffer_wrapper.op.combine(*args)
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -116,7 +134,7 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
             dispatch_scale,
             dispatch_ids,
             dispatch_recv_token_num,
-        ) = self.mori_buffer_wrapper.op.dispatch(a1, topk_weights, None, topk_ids)
+        ) = self._timed_dispatch(a1, topk_weights, None, topk_ids)
 
         local_start = self.ep_rank * self.expert_num_per_rank
         local_end = local_start + self.expert_num_per_rank
@@ -180,7 +198,7 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
                 dispatch_scale,
                 dispatch_ids,
                 dispatch_recv_token_num,
-            ) = self.mori_buffer_wrapper.op.dispatch(
+            ) = self._timed_dispatch(
                 a1[start:end], topk_weights[start:end], None, topk_ids[start:end]
             )
 
@@ -257,7 +275,7 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
 
         if _EXTERNALIZE_COMBINE_BARRIER:
             _externalize_combine_barrier(fused_out.device)
-        recv_x = self.mori_buffer_wrapper.op.combine(fused_out, None, global_dispatch_ids)[0]
+        recv_x = self._timed_combine(fused_out, None, global_dispatch_ids)[0]
 
         if extra_finalize_args is not None and "original_num_tokens" in extra_finalize_args:
             original_num_tokens = extra_finalize_args["original_num_tokens"]
@@ -285,7 +303,7 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
             chunk_out = fused_out[offset : offset + recv_size]
             if _EXTERNALIZE_COMBINE_BARRIER:
                 _externalize_combine_barrier(chunk_out.device)
-            recv_x = self.mori_buffer_wrapper.op.combine(chunk_out, None, chunk_ids)[0]
+            recv_x = self._timed_combine(chunk_out, None, chunk_ids)[0]
 
             if recv_x.shape[0] > input_size:
                 recv_x = recv_x[:input_size]
