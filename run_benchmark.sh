@@ -15,6 +15,14 @@ if [ -d "${INSTALLED_PKG_DIR}" ]; then
            && echo "Synced moriep_wrapper.py to installed package" \
            || echo "WARNING: Failed to sync moriep_wrapper.py"
     fi
+    # Sync mori_ep_intranode_router.py (carries the externalize-barrier toggle)
+    ROUTER_REL="rtp_llm/models_py/modules/factory/fused_moe/impl/rocm/routers/mori_ep_intranode_router.py"
+    if [ -f "${SOURCE_DIR}/${ROUTER_REL}" ]; then
+        cp "${SOURCE_DIR}/${ROUTER_REL}" \
+           "${INSTALLED_PKG_DIR}/${ROUTER_REL#rtp_llm/}" 2>/dev/null \
+           && echo "Synced mori_ep_intranode_router.py to installed package" \
+           || echo "WARNING: Failed to sync mori_ep_intranode_router.py"
+    fi
     # Ensure test symlink exists
     if [ ! -e "${INSTALLED_PKG_DIR}/test" ]; then
         ln -s "${SOURCE_DIR}/rtp_llm/test" "${INSTALLED_PKG_DIR}/test"
@@ -72,6 +80,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=0
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
 export HACK_LAYER_NUM=5
 export FAKE_BALANCE_EXPERT=1
+export RTP_LLM_EXTERNALIZE_COMBINE_BARRIER=1
 export GEN_TIMELINE_SYNC=1
 export INPUT_LEN_LIST="[16]"
 export BATCH_SIZE_LIST="[128]"

@@ -1,7 +1,23 @@
 from typing import Any, Dict, List, Optional
+import os
 import torch
+import torch.distributed as dist
 
 from rtp_llm.models_py.distributed.moriep_wrapper import MoriEPWrapper
+
+_EXTERNALIZE_COMBINE_BARRIER = os.environ.get("RTP_LLM_EXTERNALIZE_COMBINE_BARRIER", "0") == "1"
+_BARRIER_TENSOR_CACHE: Dict[str, torch.Tensor] = {}
+
+
+def _externalize_combine_barrier(device: torch.device) -> None:
+    if not dist.is_initialized():
+        return
+    key = str(device)
+    t = _BARRIER_TENSOR_CACHE.get(key)
+    if t is None:
+        t = torch.zeros(1, dtype=torch.float32, device=device)
+        _BARRIER_TENSOR_CACHE[key] = t
+    dist.all_reduce(t)
 
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -239,6 +255,8 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
         if global_dispatch_ids.dtype != torch.int32:
             global_dispatch_ids = global_dispatch_ids.to(torch.int32)
 
+        if _EXTERNALIZE_COMBINE_BARRIER:
+            _externalize_combine_barrier(fused_out.device)
         recv_x = self.mori_buffer_wrapper.op.combine(fused_out, None, global_dispatch_ids)[0]
 
         if extra_finalize_args is not None and "original_num_tokens" in extra_finalize_args:
@@ -265,6 +283,8 @@ class MoriEpIntranodeRouter(FusedMoeDataRouter):
                 chunk_ids = chunk_ids.to(torch.int32)
 
             chunk_out = fused_out[offset : offset + recv_size]
+            if _EXTERNALIZE_COMBINE_BARRIER:
+                _externalize_combine_barrier(chunk_out.device)
             recv_x = self.mori_buffer_wrapper.op.combine(chunk_out, None, chunk_ids)[0]
 
             if recv_x.shape[0] > input_size:
