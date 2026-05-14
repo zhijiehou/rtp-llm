@@ -8,6 +8,7 @@ from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPMode,
     DeepEPWrapper,
     DeepepWrapperConfig,
+    is_elastic_buffer,
 )
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
@@ -83,6 +84,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             wrapper.mode == DeepEPMode.LOW_LATENCY
         ), "DeepEP mode should be LOW_LATENCY"
         self._buffer = wrapper.buffer
+        # Cache buffer kind once: ElasticBuffer (v2 unified) vs legacy.Buffer
+        # (v1 low_latency_dispatch / low_latency_combine). The two have wholly
+        # different signatures and return tuples; downstream prepare/finalize
+        # branch on this flag instead of doing isinstance checks every call.
+        self._is_elastic = is_elastic_buffer(self._buffer)
         self._num_topk = wrapper.num_topk
         self._num_max_dispatch_tokens_per_rank = wrapper.ll_num_max_token_per_rank
         self._use_fp8_dispatch = use_fp8_dispatch
@@ -90,11 +96,15 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         self._async_finish = False
         self._return_recv_hook = False
         self._opt_level = int(os.environ.get("ACCL_LOW_LATENCY_OPTIMIZE", 1))
-        self._handle: Optional[Tuple[Any, ...]] = None
+        # legacy.Buffer.low_latency_dispatch returns a Tuple-shaped handle;
+        # ElasticBuffer.dispatch returns an `EPHandle` instance. Either way the
+        # router only uses it as an opaque token to feed into the matching
+        # combine call site, so we widen the annotation to `Any`.
+        self._handle: Any = None
         self._use_accl_ep = wrapper.use_accl_ep
 
     @property
-    def handle(self) -> Optional[Tuple[Any, ...]]:
+    def handle(self) -> Any:
         return self._handle
 
     def _prepare_pre_tp_slice(
@@ -171,6 +181,90 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             ),
         )
 
+    def _elastic_prepare(
+        self,
+        tp_dispatch_input: torch.Tensor,
+        tp_topk_ids: torch.Tensor,
+        tp_topk_weights: torch.Tensor,
+    ) -> ExpertForwardPayload:
+        """Elastic-backend dispatch path for low-latency routing.
+
+        PR #605 unifies low-latency and high-throughput EP under a single
+        `ElasticBuffer.dispatch`, so this collapses the legacy two-path setup
+        (`low_latency_dispatch` + `low_latency_combine`) to the same calls used
+        by the normal router. The handle returned here is `EPHandle`, not the
+        v1 tuple; `finalize` branches on `self._is_elastic` to handle that.
+        """
+
+        tp_num_tokens = tp_dispatch_input.size(0)
+        expected_m = max(
+            1,
+            int(
+                tp_num_tokens
+                * self.config.ep_size
+                * self._num_topk
+                // self._num_experts
+            ),
+        )
+
+        (
+            output,
+            recv_topk_idx,
+            recv_topk_weights,
+            self._handle,
+            _,
+        ) = self._buffer.dispatch(
+            x=tp_dispatch_input,
+            topk_idx=tp_topk_ids,
+            topk_weights=tp_topk_weights,
+            num_experts=self._num_experts,
+            num_max_tokens_per_rank=self._num_max_dispatch_tokens_per_rank,
+        )
+
+        if self._use_fp8_dispatch:
+            assert isinstance(output, tuple), "expert_x should be a tuple in fp8 mode"
+            expert_x, expert_x_scale = output
+        else:
+            assert isinstance(output, torch.Tensor)
+            expert_x, expert_x_scale = output, None
+
+        expert_num_tokens = torch.tensor(
+            self._handle.num_recv_tokens_per_expert_list,
+            device=expert_x.device,
+            dtype=torch.int32,
+        )
+
+        return ExpertForwardPayload(
+            expert_x=expert_x,
+            expert_x_scale=expert_x_scale,
+            expert_x_origin_dtype=tp_dispatch_input.dtype,
+            expert_topk_ids=recv_topk_idx if recv_topk_idx is not None else tp_topk_ids,
+            expert_topk_weights=recv_topk_weights
+            if recv_topk_weights is not None
+            else tp_topk_weights,
+            expert_tokens_meta=ExpertTokensMetadata(
+                expected_m=expected_m,
+                expert_num_tokens=expert_num_tokens,
+            ),
+        )
+
+    def _elastic_finalize(
+        self,
+        payload: CombineForwardPayload,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Elastic-backend combine path. ElasticBuffer.combine signature is
+        (x, handle, topk_weights, bias, num_sms, num_qps, ...) returning
+        (combined_x, combined_topk_weights, event)."""
+
+        assert self._handle is not None
+        combined_x, _, _ = self._buffer.combine(
+            x=payload.fused_expert_output,
+            handle=self._handle,
+            topk_weights=topk_weights,
+        )
+        return combined_x
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -213,6 +307,15 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         tp_dispatch_input, tp_topk_ids, tp_topk_weights = self._prepare_pre_tp_slice(
             a1, topk_ids, topk_weights
         )
+
+        if self._is_elastic:
+            # Elastic backend: v2 unified dispatch (no separate low_latency
+            # variant). Quant flags (`use_fp8`, `round_scale`, `pertoken_quant`)
+            # are absorbed by ElasticBuffer's `use_fp8_dispatch` constructor
+            # arg and tensor dtype, so we do not pass them through here.
+            return self._elastic_prepare(
+                tp_dispatch_input, tp_topk_ids, tp_topk_weights
+            )
 
         # Prepare dispatch basic arguments
         dispatch_args = {
@@ -299,21 +402,24 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         # Convert topk_ids to int64
         topk_ids = topk_ids.to(torch.int64)
 
-        # Prepare combine basic arguments
-        combine_args: Dict[str, Any] = {
-            "x": payload.fused_expert_output,
-            "topk_idx": topk_ids,
-            "topk_weights": topk_weights,
-            "handle": self._handle,
-            "zero_copy": self._zero_copy,
-            "async_finish": self._async_finish,
-            "return_recv_hook": self._return_recv_hook,
-        }
-        if self._use_accl_ep:
-            combine_args.update({"opt_level": self._opt_level})
+        if self._is_elastic:
+            combined_x = self._elastic_finalize(payload, topk_weights)
+        else:
+            # Prepare combine basic arguments
+            combine_args: Dict[str, Any] = {
+                "x": payload.fused_expert_output,
+                "topk_idx": topk_ids,
+                "topk_weights": topk_weights,
+                "handle": self._handle,
+                "zero_copy": self._zero_copy,
+                "async_finish": self._async_finish,
+                "return_recv_hook": self._return_recv_hook,
+            }
+            if self._use_accl_ep:
+                combine_args.update({"opt_level": self._opt_level})
 
-        # Normal finalize
-        combined_x = self._normal_finalize(combine_args)
+            # Normal finalize
+            combined_x = self._normal_finalize(combine_args)
 
         # Finalize post tp gather
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)

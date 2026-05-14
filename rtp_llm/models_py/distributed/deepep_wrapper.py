@@ -10,12 +10,13 @@ import os
 import platform
 import threading
 from dataclasses import dataclass
-from enum import IntEnum, auto
-from typing import Optional, Tuple
+from enum import Enum, IntEnum, auto
+from typing import Optional, Tuple, Union
 
 import torch
 from deep_ep import Buffer as DeepEPBuffer
 from deep_ep import Config as DeepEPConfig
+from deep_ep import ElasticBuffer as DeepEPElasticBuffer
 from torch.distributed import ProcessGroup
 
 from rtp_llm.config.engine_config import EngineConfig
@@ -31,12 +32,55 @@ __all__ = [
     "DeepepWrapperConfig",
     "DeepEPWrapper",
     "DeepEPBuffer",
+    "DeepEPElasticBuffer",
     "DeepEPConfig",
     "DeepEPMode",
+    "DeepEPBackend",
+    "deepep_backend",
+    "is_elastic_buffer",
     "use_accl_ep",
     "allow_mnnvl",
     "init_deepep_wrapper",
 ]
+
+
+_DEEPEP_BACKEND_ENV = "RTP_LLM_DEEPEP_BACKEND"
+
+
+class DeepEPBackend(str, Enum):
+    """Selectable DeepEP runtime backend.
+
+    LEGACY  -- `deep_ep.Buffer` (== `deep_ep.buffers.legacy.Buffer`), v1-compatible
+               API kept by PR #605 for behavior parity. Default.
+    ELASTIC -- `deep_ep.ElasticBuffer`, v2 unified dispatch/combine introduced by
+               PR #605. Selected by setting `RTP_LLM_DEEPEP_BACKEND=elastic` and
+               requires the runtime to provide NCCL GIN (RDMA / NIC plugin)."""
+
+    LEGACY = "legacy"
+    ELASTIC = "elastic"
+
+
+def deepep_backend() -> DeepEPBackend:
+    """Resolve the DeepEP backend from the `RTP_LLM_DEEPEP_BACKEND` env var.
+
+    Default is `legacy`, matching prompt §三 \"不修改 v1 基线代码\" semantics.
+    Anything other than `elastic` falls back to `legacy` so a typo never
+    silently flips a production deployment to v2.
+    """
+
+    raw = os.environ.get(_DEEPEP_BACKEND_ENV, "").strip().lower()
+    if raw == DeepEPBackend.ELASTIC.value:
+        return DeepEPBackend.ELASTIC
+    return DeepEPBackend.LEGACY
+
+
+def is_elastic_buffer(buffer: object) -> bool:
+    """True iff `buffer` is a `deep_ep.ElasticBuffer` (v2). Used by routers to
+    branch between v1 (`legacy.Buffer.dispatch/combine`) and v2 (`ElasticBuffer
+    .dispatch/combine`) call sites since their signatures and handle types
+    differ — see prompt §二.2."""
+
+    return isinstance(buffer, DeepEPElasticBuffer)
 
 
 def use_accl_ep() -> bool:
@@ -249,6 +293,7 @@ class DeepEPWrapper:
         """
         self._config = config
         self._use_accl_ep = use_accl_ep()
+        self._backend: DeepEPBackend = deepep_backend()
 
         self._mode, self._buffer = self._init_deepep_buffer(group)
 
@@ -370,11 +415,15 @@ class DeepEPWrapper:
             cls._initialized = False
 
     @property
-    def buffer(self) -> DeepEPBuffer:
+    def buffer(self) -> Union[DeepEPBuffer, DeepEPElasticBuffer]:
         """Get the DeepEP buffer.
 
         Returns:
-            The initialized DeepEP buffer
+            The initialized DeepEP buffer. Either a `DeepEPBuffer` (legacy v1
+            API) or a `DeepEPElasticBuffer` (v2 unified API), depending on
+            `RTP_LLM_DEEPEP_BACKEND`. Callers that branch on type should use
+            `is_elastic_buffer(...)` rather than isinstance checks against
+            internal classes.
         """
         if self._buffer is None:
             raise RuntimeError("DeepEP buffer is not initialized")
@@ -384,6 +433,11 @@ class DeepEPWrapper:
     def mode(self) -> DeepEPMode:
         """Get the DeepEP mode."""
         return self._mode
+
+    @property
+    def backend(self) -> DeepEPBackend:
+        """Resolved DeepEP backend (legacy / elastic)."""
+        return self._backend
 
     @property
     def config(self) -> DeepepWrapperConfig:
@@ -432,16 +486,36 @@ class DeepEPWrapper:
 
     def _init_deepep_buffer(
         self, group: ProcessGroup
-    ) -> Tuple[DeepEPMode, DeepEPBuffer]:
+    ) -> Tuple[DeepEPMode, Union[DeepEPBuffer, DeepEPElasticBuffer]]:
         """Initialize DeepEP buffer based on configuration.
+
+        Dispatch by `RTP_LLM_DEEPEP_BACKEND`:
+          - `legacy` (default): preserve v1 behavior, route to one of the three
+            existing `_init_{normal,low_latency,low_latency_m2n}_buffer` paths
+            based on `use_deepep_low_latency` / `enable_ffn_disaggregate`.
+          - `elastic`: PR #605 unifies high-throughput and low-latency under a
+            single `ElasticBuffer`, so the three legacy paths collapse to one
+            init. The wrapper still reports a DeepEPMode so downstream call
+            sites (router) can keep their mode-aware logic.
 
         Args:
             group: ProcessGroup for distributed communication
 
         Returns:
-            Tuple of (DeepEPMode, DeepEPBuffer)
+            Tuple of (DeepEPMode, buffer). The buffer is either DeepEPBuffer
+            (legacy) or DeepEPElasticBuffer (elastic).
         """
         config = self._config
+
+        if self._backend is DeepEPBackend.ELASTIC:
+            mode = (
+                DeepEPMode.LOW_LATENCY_M2N
+                if config.use_deepep_low_latency and config.enable_ffn_disaggregate
+                else DeepEPMode.LOW_LATENCY
+                if config.use_deepep_low_latency
+                else DeepEPMode.NORMAL
+            )
+            return mode, self._init_elastic_buffer(group)
 
         if config.use_deepep_low_latency and config.enable_ffn_disaggregate:
             if self._use_accl_ep:
@@ -465,6 +539,60 @@ class DeepEPWrapper:
                 f"use_deepep_low_latency={config.use_deepep_low_latency}, "
                 f"enable_ffn_disaggregate={config.enable_ffn_disaggregate}"
             )
+
+    def _init_elastic_buffer(self, group: ProcessGroup) -> DeepEPElasticBuffer:
+        """Initialize a v2 unified `ElasticBuffer` for both high-throughput and
+        low-latency dispatch (PR #605).
+
+        Sizing policy:
+          - `num_max_tokens_per_rank`: prefer `config.ll_num_max_token_per_rank`
+            (set by the low-latency / FFN-disaggregate path); fall back to
+            `config.ll_num_max_token`; finally 0 (which `ElasticBuffer` handles).
+          - `hidden`, `num_topk` come straight from the wrapper config.
+          - `num_bytes` is derived from `ElasticBuffer.get_buffer_size_hint`.
+
+        Runtime requirement: NCCL GIN backend (RDMA-capable NIC + libnccl-gin.so
+        plugin). On nodes without GIN this init asserts at the C++ layer with
+        a clear error pointing to network configuration; that is by design and
+        not a wrapper bug.
+        """
+
+        config = self._config
+        max_seq_len = int(os.environ.get("MAX_SEQ_LEN", "0"))
+        num_max_tokens_per_rank = (
+            config.ll_num_max_token_per_rank
+            or config.ll_num_max_token
+            or (max_seq_len // config.tp_size if max_seq_len > 0 else 0)
+            or 0
+        )
+        hidden = config.hidden_size
+        num_topk = config.moe_k
+
+        num_bytes = DeepEPElasticBuffer.get_buffer_size_hint(
+            group=group,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden,
+            num_topk=num_topk,
+            use_fp8_dispatch=False,
+        )
+
+        if config.local_rank == 0:
+            print(
+                f"[ElasticBuffer] num_bytes={num_bytes / 1e6:.1f} MB, "
+                f"num_max_tokens_per_rank={num_max_tokens_per_rank}, "
+                f"hidden={hidden}, num_topk={num_topk}, "
+                f"ep_size={config.ep_size}, num_experts={config.expert_num}",
+                flush=True,
+            )
+
+        return DeepEPElasticBuffer(
+            group=group,
+            num_bytes=num_bytes,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden,
+            num_topk=num_topk,
+            use_fp8_dispatch=False,
+        )
 
     def _init_normal_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
         """Initialize buffer for normal mode."""
