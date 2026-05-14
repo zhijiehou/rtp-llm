@@ -7,6 +7,7 @@ from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPMode,
     DeepEPWrapper,
     DeepepWrapperConfig,
+    is_elastic_buffer,
 )
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
@@ -87,6 +88,10 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
     ) -> ExpertForwardPayload:
         if a1_scale is not None or a2_scale is not None:
             raise ValueError("DeepEPNormal a1_scale or a2_scale should be None")
+
+        if is_elastic_buffer(self.deepep_buffer_wrapper.buffer):
+            return self._prepare_elastic(a1, topk_weights, topk_ids)
+
         act_dtype = a1.dtype
 
         # scatter
@@ -201,9 +206,19 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
     ) -> torch.Tensor:
         assert self.handle is not None, "handler is None"
         assert payload.fused_expert_output is not None, "fused_expert_output is None"
-        out_token, _, _ = self.deepep_buffer_wrapper.buffer.combine(
-            payload.fused_expert_output, self.handle
-        )
+        if is_elastic_buffer(self.deepep_buffer_wrapper.buffer):
+            # ElasticBuffer.combine takes the EPHandle from dispatch and (optionally)
+            # the dispatched recv_topk_weights for weighted reduce. The legacy path
+            # leaves weighted reduce to the executor (no topk_weights into combine),
+            # so we mirror that here for behavior parity.
+            out_token, _, _ = self.deepep_buffer_wrapper.buffer.combine(
+                x=payload.fused_expert_output,
+                handle=self.handle,
+            )
+        else:
+            out_token, _, _ = self.deepep_buffer_wrapper.buffer.combine(
+                payload.fused_expert_output, self.handle
+            )
         self.handle = None
 
         # gather
@@ -230,6 +245,116 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
 
         # out_token should be a tensor with shape and dtype like a1
         return out_token
+
+    def _prepare_elastic(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> ExpertForwardPayload:
+        """Prepare path for `RTP_LLM_DEEPEP_BACKEND=elastic`.
+
+        Differences from the legacy path:
+          - No `get_dispatch_layout` call. ElasticBuffer's unified API computes
+            the layout internally from `topk_idx`.
+          - `dispatch` returns a 5-tuple `(recv_x_or_pair, recv_topk_idx,
+            recv_topk_weights, handle: EPHandle, event)` instead of legacy's
+            6-tuple. The per-expert recv counts come from `handle
+            .num_recv_tokens_per_expert_list` (CPU-side python list).
+          - Quantization (FP8 / FP4) and TP scatter logic mirror the legacy
+            branch so downstream executors see the same payload shape.
+        """
+
+        act_dtype = a1.dtype
+
+        tp_size = self.config.tp_size
+        tp_rank = self.config.tp_rank
+        token_num = a1.size(0)
+        tp_token_size = (token_num + tp_size - 1) // tp_size
+
+        slice_begin = min(tp_token_size * tp_rank, token_num)
+        slice_size = min(token_num - slice_begin, tp_token_size)
+
+        use_fp8 = (
+            self.quant_config.is_quantized
+            and self.quant_config.quant_dtype == torch.float8_e4m3fn
+        )
+        quant_method = MoeConfigResolver().get_quant_method(self.config)
+        use_fp4 = quant_method == "modelopt_fp4"
+        if use_fp8:
+            a1_quant, a1_scale_quant = self._do_quant(a1)
+            assert a1_scale_quant is not None
+            tp_expert_a1 = torch.narrow(a1_quant, 0, slice_begin, slice_size)
+            tp_expert_a1_scale = torch.narrow(
+                a1_scale_quant, 0, slice_begin, slice_size
+            )
+            tp_expert_input = (tp_expert_a1, tp_expert_a1_scale)
+        else:
+            tp_expert_a1 = torch.narrow(a1, 0, slice_begin, slice_size)
+            tp_expert_input = tp_expert_a1
+
+        tp_expert_ids = torch.narrow(topk_ids, 0, slice_begin, slice_size).to(
+            torch.int64
+        )
+        tp_expert_scales = torch.narrow(topk_weights, 0, slice_begin, slice_size)
+
+        # ElasticBuffer.dispatch — unified API, no separate `get_dispatch_layout`.
+        (
+            output,
+            recv_topk_idx,
+            recv_topk_weights,
+            self.handle,
+            _,
+        ) = self.deepep_buffer_wrapper.buffer.dispatch(
+            x=tp_expert_input,
+            topk_idx=tp_expert_ids,
+            topk_weights=tp_expert_scales,
+            num_experts=self.expert_num,
+            expert_alignment=self.expert_alignment,
+        )
+
+        expert_x_scale: Optional[torch.Tensor] = None
+        if use_fp8:
+            assert isinstance(output, tuple), "output should be a tuple"
+            expert_x, expert_x_scale = output
+            if self.quant_config.is_per_act_token:
+                expert_x_scale = expert_x_scale[:, 0].contiguous()
+        else:
+            assert isinstance(output, torch.Tensor), "output should be a tensor"
+            expert_x = output
+
+        num_recv_tokens_per_expert_list = self.handle.num_recv_tokens_per_expert_list
+        expert_num_tokens = torch.tensor(
+            num_recv_tokens_per_expert_list,
+            device=expert_x.device,
+            dtype=torch.int32,
+        )
+
+        if (
+            recv_topk_idx is not None
+            and recv_topk_idx.numel() != 0
+            and (not use_fp8)
+            and (not use_fp4)
+        ):
+            expert_topk_ids = torch.where(
+                recv_topk_idx == -1,
+                self.expert_num - 1 if self.rank_expert_offset == 0 else 0,
+                recv_topk_idx + self.rank_expert_offset,
+            )
+        else:
+            expert_topk_ids = recv_topk_idx
+
+        return ExpertForwardPayload(
+            expert_x=expert_x,
+            expert_x_scale=expert_x_scale,
+            expert_x_origin_dtype=act_dtype,
+            expert_topk_ids=expert_topk_ids,
+            expert_topk_weights=recv_topk_weights,
+            expert_tokens_meta=ExpertTokensMetadata(
+                expert_num_tokens=expert_num_tokens,
+                expert_num_tokens_cpu=num_recv_tokens_per_expert_list,
+            ),
+        )
 
     def _do_quant(
         self, a1: torch.Tensor
