@@ -64,16 +64,20 @@ else:
 
     # MoE strategies
     from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
+        CudaFp8PerBlockEpElasticContiguousStrategy,
         CudaFp8PerBlockEpLowLatencyStrategy,
         CudaFp8PerBlockEpNormalStrategy,
         CudaFp8PerBlockNoDPMaskedStrategy,
         CudaFp8PerBlockNoDPStrategy,
+        CudaFp8PerTensorEpElasticContiguousStrategy,
         CudaFp8PerTensorEpLowLatencyStrategy,
         CudaFp8PerTensorEpNormalStrategy,
         CudaFp8PerTensorNoDPStrategy,
         CudaNoQuantCppStrategy,
         CudaNoQuantDpNormalStrategy,
+        CudaNoQuantEpElasticContiguousStrategy,
         CudaNoQuantEpLowLatencyStrategy,
+        CudaW4a8Int4PerChannelEpElasticContiguousStrategy,
         CudaW4a8Int4PerChannelEpLowLatencyStrategy,
         CudaW4a8Int4PerChannelEpNormalStrategy,
         CudaW4a8Int4PerChannelNoDPStrategy,
@@ -94,9 +98,20 @@ else:
     registry.register(CudaW4a8Int4PerChannelEpLowLatencyStrategy())
     registry.register(CudaW4a8Int4PerChannelEpNormalStrategy())
     registry.register(CudaW4a8Int4PerChannelNoDPStrategy())
+    # DeepEPv2 elastic 2D Contiguous variants — gated by USE_DEEPEP_ELASTIC=1
+    # inside DeepEpElasticRouter.check_conditions(), so they never win
+    # priority on the default codepath. Only the 2D Contiguous path is
+    # supported (do_expand=True, do_cpu_sync=True): the 3D Batched path was
+    # removed because DeepEPv2 leaves recv_x compact 2D when do_cpu_sync=False
+    # and the masked GEMM kernels would read uninitialised memory.
+    registry.register(CudaNoQuantEpElasticContiguousStrategy())
+    registry.register(CudaFp8PerBlockEpElasticContiguousStrategy())
+    registry.register(CudaFp8PerTensorEpElasticContiguousStrategy())
+    registry.register(CudaW4a8Int4PerChannelEpElasticContiguousStrategy())
     # Only register FP4 strategies on SM_100+ (and only if CUDA GPU is available)
     if torch.cuda.is_available() and is_cuda() and get_sm()[0] >= 10:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
+            CudaFp4EpElasticContiguousStrategy,
             CudaFp4EpLowLatencyStrategy,
             CudaFp4EpNormalStrategy,
             CudaFp4NoDPStrategy,
@@ -105,4 +120,5 @@ else:
         registry.register(CudaFp4EpLowLatencyStrategy())
         registry.register(CudaFp4EpNormalStrategy())
         registry.register(CudaFp4NoDPStrategy())
+        registry.register(CudaFp4EpElasticContiguousStrategy())
     FusedMoeFactory.set_registry(registry)

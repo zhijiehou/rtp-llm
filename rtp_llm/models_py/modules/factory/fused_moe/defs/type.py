@@ -12,6 +12,7 @@ class RouterType(Enum):
     DEEPEP_NORMAL = 2  # DeepEP normal mode
     DEEPEP_LOW_LATENCY = 4  # DeepEP low latency mode (best communication)
     PURE_TP = 5  # optimize when EP=TP, use all_reduce as gather
+    DEEPEP_ELASTIC = 6  # DeepEPv2 elastic unified dispatch/combine (highest priority when USE_DEEPEP_ELASTIC=1)
 
 
 class ExecutorType(Enum):

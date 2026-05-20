@@ -1,5 +1,6 @@
 """CUDA FP4 Per-Group quantization strategies"""
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -93,6 +94,47 @@ class CudaFp4EpNormalStrategy(MoeStrategy):
         )
         return StrategyAttributes(
             router_class=DeepepNormalRouterFp4PerGroup,
+            executor_class=TrtllmFp4Executor,
+            quant_config=quant_config,
+        )
+
+
+class CudaFp4EpElasticContiguousStrategy(MoeStrategy):
+    """CUDA FP4 PerGroup EP elastic 2D Contiguous strategy.
+
+    Selected when ``USE_DEEPEP_ELASTIC=1`` with the default
+    ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` —
+    pairs the elastic router (tight ``[ΣN_e, hidden]`` layout) with
+    ``TrtllmFp4Executor``.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "modelopt_fp4")
+        do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
+        do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
+        checker.check(do_expand and do_cpu_sync)
+        checker.check(
+            config.moe_strategy == "fp4_ep_elastic_contiguous"
+            or config.moe_strategy == "auto"
+        )
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.trtllm_fp4_executor import (
+            TrtllmFp4Executor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_elastic_router import (
+            DeepEpElasticRouter,
+        )
+
+        quant_config = FusedMoEQuantConfig(
+            quant_dtype=torch.uint8,
+            block_shape=[16, 16],
+        )
+        return StrategyAttributes(
+            router_class=DeepEpElasticRouter,
             executor_class=TrtllmFp4Executor,
             quant_config=quant_config,
         )

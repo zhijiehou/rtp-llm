@@ -1,5 +1,6 @@
 """CUDA W4A8 INT4 PerChannel quantization strategies"""
 
+import os
 from typing import Any
 
 import torch
@@ -110,6 +111,50 @@ class CudaW4a8Int4PerChannelEpNormalStrategy(MoeStrategy):
         )
         return StrategyAttributes(
             router_class=DeepepNormalRouterW4a8Int4PerChannel,
+            executor_class=CutlassExpertsW4a8Int4PerChannel,
+            quant_config=quant_config,
+        )
+
+
+class CudaW4a8Int4PerChannelEpElasticContiguousStrategy(MoeStrategy):
+    """CUDA W4A8 INT4 PerChannel EP elastic 2D Contiguous strategy.
+
+    Selected when ``USE_DEEPEP_ELASTIC=1`` with the default
+    ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` —
+    pairs the elastic router (tight ``[ΣN_e, hidden]`` layout) with
+    ``CutlassExpertsW4a8Int4PerChannel``.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(
+            quant_method
+            in ("W4A8_INT4_PER_CHANNEL", "W4A8_INT4_PER_CHANNEL_COMPRESSED")
+        )
+        do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
+        do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
+        checker.check(do_expand and do_cpu_sync)
+        checker.check(
+            config.moe_strategy == "w4a8_int4_per_channel_ep_elastic_contiguous"
+            or config.moe_strategy == "auto"
+        )
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.cutlass_w4a8_moe import (
+            CutlassExpertsW4a8Int4PerChannel,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_elastic_router import (
+            DeepEpElasticRouter,
+        )
+
+        quant_config = FusedMoEQuantConfig(
+            quant_dtype=torch.float8_e4m3fn,
+            per_act_token_quant=True,
+        )
+        return StrategyAttributes(
+            router_class=DeepEpElasticRouter,
             executor_class=CutlassExpertsW4a8Int4PerChannel,
             quant_config=quant_config,
         )
