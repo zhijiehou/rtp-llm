@@ -265,6 +265,55 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         act_dtype = a1.dtype
 
+        # NaN-input guard (collective-safe, in-place sanitisation).
+        # Iter 9 diagnosis: the model produces NaN at layer 1 on
+        # rank 1 during engine init warmup (qwen35_moe has a known
+        # numerical edge case with the synthetic init input). Legacy
+        # DeepEP tolerates this silently — its dispatch doesn't
+        # assert on topk_idx duplicates. Elastic DeepEPv2 dispatch
+        # has `ptx::deduplicate(dst_expert_idx, lane_idx)` which
+        # fails when input is all-NaN → gate(NaN) → argmax(NaN) → 0
+        # → topk=[0,0,...,0] all duplicates.
+        #
+        # Mitigation: replace NaN-tainted inputs IN PLACE before
+        # dispatch — substitute zeros for `a1`, uniform 1/k for
+        # `topk_weights`, and a distinct round-robin id sequence
+        # for `topk_ids`. Dispatch is a collective operation, so we
+        # cannot early-return on a subset of ranks (that deadlocks
+        # the comm); we must call it on every rank with safe inputs.
+        # Default on; disable with =0 to expose the underlying NaN
+        # for model-side debugging.
+        nan_guard_active = int(os.environ.get("DEEPEP_ELASTIC_NAN_GUARD", "1"))
+        if nan_guard_active:
+            tainted = bool(
+                torch.isnan(a1).any().item()
+                or torch.isnan(topk_weights).any().item()
+            )
+            if tainted:
+                if not getattr(DeepEpElasticRouter, "_logged_nan_guard", False):
+                    print(
+                        f"[DeepEpElasticRouter] NAN_GUARD fired (rank "
+                        f"{self._ep_rank}) — sanitising NaN-tainted input "
+                        f"before dispatch (a1 → zeros, topk → "
+                        f"round-robin, weights → 1/k). Mirrors legacy "
+                        f"DeepEP silent-tolerance.",
+                        flush=True,
+                    )
+                    DeepEpElasticRouter._logged_nan_guard = True
+                a1 = torch.zeros_like(a1)
+                # Build distinct ids per row so ptx::deduplicate stays
+                # happy: row r, slot k → expert (r*num_topk + k) %
+                # num_experts. With num_topk <= num_experts (always
+                # true) the per-row k slots are guaranteed distinct.
+                rows = topk_ids.size(0)
+                k = topk_ids.size(1)
+                base = (
+                    torch.arange(rows, device=topk_ids.device).unsqueeze(1) * k
+                    + torch.arange(k, device=topk_ids.device).unsqueeze(0)
+                )
+                topk_ids = (base % self._num_experts).to(topk_ids.dtype)
+                topk_weights = torch.full_like(topk_weights, 1.0 / float(k))
+
         tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(
             a1, topk_ids, topk_weights
         )
