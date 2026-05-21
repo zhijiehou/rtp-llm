@@ -281,7 +281,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         else:
             x_payload = tp_a1
 
-        recv_x, recv_topk_idx, recv_topk_weights, handle, _event = (
+        recv_x, recv_topk_idx, recv_topk_weights, handle, event = (
             self._buffer.dispatch(
                 x=x_payload,
                 topk_idx=tp_topk_ids,
@@ -290,9 +290,26 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 expert_alignment=self._expert_alignment,
                 do_expand=self._do_expand,
                 do_cpu_sync=self._do_cpu_sync,
-                async_with_compute_stream=False,
+                # Use async-with-compute-stream so dispatch returns a real
+                # CUDA event we can wait on. async_with_compute_stream=False
+                # ran dispatch on a separate comm stream without capturing
+                # an event, leaving downstream reads racing against in-
+                # flight writes — see iter 3 anomaly trap diagnosis.
+                async_with_compute_stream=True,
             )
         )
+        # ESSENTIAL: ElasticBuffer.dispatch may complete asynchronously on
+        # its internal comm stream; do_cpu_sync only synchronises the CPU
+        # side (per-expert counts), not the GPU data tensors. Without this
+        # wait, downstream executor reads recv_x while it's still being
+        # written, producing garbage that cascades into NaN a few layers
+        # later. Matches vLLM PR #41183 prepare_finalize/deepep_v2.py.
+        # NB: EventOverlap wraps an inner CUDA event; that inner event is
+        # None when async_with_compute_stream=False, so we have to peek
+        # inside before calling current_stream_wait (which asserts inner
+        # event is not None).
+        if event is not None and getattr(event, "event", None) is not None:
+            event.current_stream_wait()
         self._handle = handle
 
         if isinstance(recv_x, tuple):
@@ -394,12 +411,17 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         # row already carries its own (token, expert) identity — weights are
         # baked into the per-expert layout and combine performs a simple
         # gather, not a topk reduction, so topk_weights=None.
-        combined_x, _, _ = self._buffer.combine(
+        combined_x, _, combine_event = self._buffer.combine(
             x=x,
             handle=self._handle,
             topk_weights=None,
-            async_with_compute_stream=False,
+            async_with_compute_stream=True,
         )
+        if (
+            combine_event is not None
+            and getattr(combine_event, "event", None) is not None
+        ):
+            combine_event.current_stream_wait()
         self._handle = None
 
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)
