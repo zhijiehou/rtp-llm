@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -201,10 +202,68 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
     ) -> torch.Tensor:
         assert self.handle is not None, "handler is None"
         assert payload.fused_expert_output is not None, "fused_expert_output is None"
+
+        # Legacy-side stats trap mirroring DeepEpElasticRouter, so we can
+        # bit-compare combine_x rank/seq side-by-side. Gated by env so a
+        # default baseline run is silent.
+        if int(os.environ.get("DEEPEP_NORMAL_DEBUG_STATS", "0")):
+            seq_f = (
+                getattr(DeepepNormalRouterBase, "_finalize_seq", 0) + 1
+            )
+            DeepepNormalRouterBase._finalize_seq = seq_f
+            max_prints = int(
+                os.environ.get("DEEPEP_NORMAL_DEBUG_STATS_MAX", "6")
+            )
+            n_printed = getattr(DeepepNormalRouterBase, "_finalize_printed", 0)
+            x = payload.fused_expert_output
+            if n_printed < max_prints and x.numel() > 0:
+                with torch.no_grad():
+                    xf = x.detach().to(torch.float32)
+                    nan_cnt = int(torch.isnan(xf).sum().item())
+                    inf_cnt = int(torch.isinf(xf).sum().item())
+                    safe = xf[~torch.isnan(xf) & ~torch.isinf(xf)]
+                    max_abs = float(safe.abs().max().item()) if safe.numel() else 0.0
+                    mean_abs = float(safe.abs().mean().item()) if safe.numel() else 0.0
+                print(
+                    f"[DeepepNormalRouter] FINALIZE seq={seq_f} "
+                    f"ep_rank={self.ep_rank} "
+                    f"executor_x.shape={tuple(x.shape)} nan={nan_cnt} inf={inf_cnt} "
+                    f"max_abs={max_abs:.4g} mean_abs={mean_abs:.4g}",
+                    flush=True,
+                )
+                DeepepNormalRouterBase._finalize_printed = n_printed + 1
+
         out_token, _, _ = self.deepep_buffer_wrapper.buffer.combine(
             payload.fused_expert_output, self.handle
         )
         self.handle = None
+
+        # Combine stats trap (after combine, before TP gather).
+        if int(os.environ.get("DEEPEP_NORMAL_DEBUG_STATS", "0")):
+            seq_c = (
+                getattr(DeepepNormalRouterBase, "_combine_seq", 0) + 1
+            )
+            DeepepNormalRouterBase._combine_seq = seq_c
+            max_prints = int(
+                os.environ.get("DEEPEP_NORMAL_DEBUG_STATS_MAX", "6")
+            )
+            n_p2 = getattr(DeepepNormalRouterBase, "_combine_printed", 0)
+            if n_p2 < max_prints and out_token.numel() > 0:
+                with torch.no_grad():
+                    cf = out_token.detach().to(torch.float32)
+                    nan_cnt = int(torch.isnan(cf).sum().item())
+                    inf_cnt = int(torch.isinf(cf).sum().item())
+                    safe = cf[~torch.isnan(cf) & ~torch.isinf(cf)]
+                    max_abs = float(safe.abs().max().item()) if safe.numel() else 0.0
+                    mean_abs = float(safe.abs().mean().item()) if safe.numel() else 0.0
+                print(
+                    f"[DeepepNormalRouter] COMBINE seq={seq_c} "
+                    f"ep_rank={self.ep_rank} "
+                    f"combined_x.shape={tuple(out_token.shape)} nan={nan_cnt} "
+                    f"inf={inf_cnt} max_abs={max_abs:.4g} mean_abs={mean_abs:.4g}",
+                    flush=True,
+                )
+                DeepepNormalRouterBase._combine_printed = n_p2 + 1
 
         # gather
         tp_size = self.config.tp_size

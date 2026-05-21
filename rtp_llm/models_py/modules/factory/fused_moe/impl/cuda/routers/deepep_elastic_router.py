@@ -314,6 +314,36 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 topk_ids = (base % self._num_experts).to(topk_ids.dtype)
                 topk_weights = torch.full_like(topk_weights, 1.0 / float(k))
 
+        # FULL_BYPASS: skip both dispatch and combine entirely. Pretend the
+        # MoE produced zeros. Use to confirm whether the elastic kernel
+        # calls themselves (rather than their return values) are corrupting
+        # other ranks' memory via P2P side effects.
+        if int(os.environ.get("DEEPEP_ELASTIC_FULL_BYPASS", "0")):
+            if not getattr(DeepEpElasticRouter, "_logged_full_bypass", False):
+                print(
+                    "[DeepEpElasticRouter] FULL_BYPASS enabled — skipping "
+                    "dispatch and combine entirely, returning zero payload",
+                    flush=True,
+                )
+                DeepEpElasticRouter._logged_full_bypass = True
+            self._handle = "__FULL_BYPASS__"
+            zero_x = torch.zeros((1, a1.size(1)), dtype=torch.bfloat16, device=a1.device)
+            zero_ids = torch.zeros((1, 1), dtype=torch.int64, device=a1.device)
+            zero_w = torch.zeros((1, 1), dtype=topk_weights.dtype, device=a1.device)
+            return ExpertForwardPayload(
+                expert_x=zero_x,
+                expert_x_scale=None,
+                expert_x_origin_dtype=act_dtype,
+                expert_topk_ids=zero_ids,
+                expert_topk_weights=zero_w,
+                expert_tokens_meta=ExpertTokensMetadata(
+                    expert_num_tokens=torch.zeros(
+                        self._expert_per_rank, dtype=torch.int32, device=a1.device
+                    ),
+                    expert_num_tokens_cpu=[0] * self._expert_per_rank,
+                ),
+            )
+
         tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(
             a1, topk_ids, topk_weights
         )
@@ -360,6 +390,49 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         if event is not None and getattr(event, "event", None) is not None:
             event.current_stream_wait()
         self._handle = handle
+
+        # Handle metadata diagnostic — dump per-rank what combine will use
+        # for reverse-routing. Used in iter 8 to disprove a suspected
+        # combine reverse-mapping bug (turned out 3 ranks just had
+        # identical input topk_idx so identical output was correct).
+        if int(os.environ.get("DEEPEP_ELASTIC_DUMP_HANDLE", "0")):
+            n_done = getattr(DeepEpElasticRouter, "_handle_dump_done", 0)
+            max_n = int(os.environ.get("DEEPEP_ELASTIC_DUMP_HANDLE_MAX", "4"))
+            if n_done < max_n:
+                def _summ(t, name):
+                    if t is None:
+                        return f"{name}=None"
+                    if not hasattr(t, "shape"):
+                        return f"{name}=type:{type(t).__name__} val={t!r}"
+                    flat = t.detach().to(torch.int64).flatten() if t.numel() else t
+                    head = flat[: min(8, flat.numel())].tolist() if flat.numel() else []
+                    s = float(flat.sum().item()) if flat.numel() else 0.0
+                    return (
+                        f"{name}.shape={tuple(t.shape)} dtype={t.dtype} "
+                        f"sum={s} head={head}"
+                    )
+                attrs = (
+                    "num_recv_tokens_per_expert_list",
+                    "psum_num_recv_tokens_per_scaleup_rank",
+                    "psum_num_recv_tokens_per_expert",
+                    "recv_src_metadata",
+                    "dst_buffer_slot_idx",
+                    "topk_idx",
+                    "num_recv_tokens",
+                    "num_experts",
+                    "expert_alignment",
+                    "num_max_tokens_per_rank",
+                    "do_expand",
+                )
+                lines = [f"  rank={self._ep_rank}:"]
+                for a in attrs:
+                    v = getattr(handle, a, "<missing>")
+                    lines.append("    " + _summ(v, a))
+                print(
+                    "[DeepEpElasticRouter] HANDLE_DUMP\n" + "\n".join(lines),
+                    flush=True,
+                )
+                DeepEpElasticRouter._handle_dump_done = n_done + 1
 
         if isinstance(recv_x, tuple):
             expert_x, expert_x_scale = recv_x
@@ -451,10 +524,56 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             self._handle is not None
         ), "DeepEpElasticRouter.finalize() called without a live EPHandle"
 
+        # FULL_BYPASS short-circuit: skip combine entirely, return zeros
+        # shaped like the original input (so downstream residual add works).
+        if self._handle == "__FULL_BYPASS__":
+            self._handle = None
+            original_num_tokens = (
+                extra_finalize_args.get("original_num_tokens")
+                if extra_finalize_args
+                else None
+            )
+            if original_num_tokens is None:
+                original_num_tokens = payload.fused_expert_output.size(0)
+            hidden = payload.fused_expert_output.size(1)
+            return torch.zeros(
+                (original_num_tokens, hidden),
+                dtype=torch.bfloat16,
+                device=payload.fused_expert_output.device,
+            )
+
         x = payload.fused_expert_output
         assert (
             x.dtype == torch.bfloat16
         ), f"ElasticBuffer.combine requires bfloat16 input, got {x.dtype}"
+
+        # Always log first N finalize calls — print value stats (max abs,
+        # mean, NaN count) of the executor output so we see whether it's
+        # SILENTLY DEGRADED (e.g. all-zero, abnormally large, or off-scale
+        # vs legacy) even when not NaN.
+        if int(os.environ.get("DEEPEP_ELASTIC_DEBUG_ANOMALY", "1")):
+            seq = getattr(DeepEpElasticRouter, "_finalize_seq", 0) + 1
+            DeepEpElasticRouter._finalize_seq = seq
+            max_prints = int(
+                os.environ.get("DEEPEP_ELASTIC_FINALIZE_DEBUG_MAX", "6")
+            )
+            n_printed = getattr(DeepEpElasticRouter, "_finalize_printed", 0)
+            if n_printed < max_prints and x.numel() > 0:
+                with torch.no_grad():
+                    xf = x.detach().to(torch.float32)
+                    nan_cnt = int(torch.isnan(xf).sum().item())
+                    inf_cnt = int(torch.isinf(xf).sum().item())
+                    safe = xf[~torch.isnan(xf) & ~torch.isinf(xf)]
+                    max_abs = float(safe.abs().max().item()) if safe.numel() else 0.0
+                    mean_abs = float(safe.abs().mean().item()) if safe.numel() else 0.0
+                    zero_frac = float((safe == 0).float().mean().item()) if safe.numel() else 0.0
+                print(
+                    f"[DeepEpElasticRouter] FINALIZE seq={seq} ep_rank={self._ep_rank} "
+                    f"executor_x.shape={tuple(x.shape)} nan={nan_cnt} inf={inf_cnt} "
+                    f"max_abs={max_abs:.4g} mean_abs={mean_abs:.4g} zero_frac={zero_frac:.3f}",
+                    flush=True,
+                )
+                DeepEpElasticRouter._finalize_printed = n_printed + 1
 
         # With do_expand=True (always, asserted in __init__), each dispatched
         # row already carries its own (token, expert) identity — weights are
@@ -473,5 +592,89 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             combine_event.current_stream_wait()
         self._handle = None
 
+        # Cross-rank combined_x diff check: gather combined_x from all 4 ranks
+        # and check bit-for-bit equality. If 3 ranks see identical data, combine
+        # semantics is broadcasting instead of per-rank-correct reverse-mapping.
+        # Gated to first N invocations; ALL ranks must always do the gather to
+        # avoid NCCL deadlock.
+        if int(os.environ.get("DEEPEP_ELASTIC_CROSS_RANK_DIFF", "0")):
+            n_done = getattr(DeepEpElasticRouter, "_xrank_diff_done", 0)
+            max_n = int(os.environ.get("DEEPEP_ELASTIC_CROSS_RANK_DIFF_MAX", "3"))
+            if n_done < max_n:
+                try:
+                    import torch.distributed as dist
+                    gathered = [
+                        torch.empty_like(combined_x) for _ in range(self._ep_size)
+                    ]
+                    dist.all_gather(gathered, combined_x.contiguous())
+                    with torch.no_grad():
+                        per_rank_diff_vs_0 = []
+                        for r in range(self._ep_size):
+                            if r == 0:
+                                per_rank_diff_vs_0.append(0.0)
+                            else:
+                                d = (
+                                    gathered[r].to(torch.float32)
+                                    - gathered[0].to(torch.float32)
+                                ).abs().max().item()
+                                per_rank_diff_vs_0.append(float(d))
+                        # also per-rank sum-of-abs as a fingerprint
+                        rank_sums = [
+                            float(g.to(torch.float32).abs().sum().item())
+                            for g in gathered
+                        ]
+                    print(
+                        f"[DeepEpElasticRouter] CROSS_RANK_DIFF n={n_done} "
+                        f"ep_rank={self._ep_rank} "
+                        f"shape={tuple(combined_x.shape)} "
+                        f"diff_vs_rank0={per_rank_diff_vs_0} "
+                        f"abs_sum_per_rank={rank_sums}",
+                        flush=True,
+                    )
+                    DeepEpElasticRouter._xrank_diff_done = n_done + 1
+                except Exception as e:
+                    print(
+                        f"[DeepEpElasticRouter] CROSS_RANK_DIFF skipped: {e!r}",
+                        flush=True,
+                    )
+
+        # Always-log stats on combine output for first N calls, same idea.
+        if int(os.environ.get("DEEPEP_ELASTIC_DEBUG_ANOMALY", "1")):
+            seq2 = getattr(DeepEpElasticRouter, "_combine_seq", 0) + 1
+            DeepEpElasticRouter._combine_seq = seq2
+            max_p2 = int(os.environ.get("DEEPEP_ELASTIC_COMBINE_DEBUG_MAX", "6"))
+            n_p2 = getattr(DeepEpElasticRouter, "_combine_printed", 0)
+            if n_p2 < max_p2 and combined_x.numel() > 0:
+                with torch.no_grad():
+                    cf = combined_x.detach().to(torch.float32)
+                    nan_cnt = int(torch.isnan(cf).sum().item())
+                    inf_cnt = int(torch.isinf(cf).sum().item())
+                    safe = cf[~torch.isnan(cf) & ~torch.isinf(cf)]
+                    max_abs = float(safe.abs().max().item()) if safe.numel() else 0.0
+                    mean_abs = float(safe.abs().mean().item()) if safe.numel() else 0.0
+                    zero_frac = float((safe == 0).float().mean().item()) if safe.numel() else 0.0
+                print(
+                    f"[DeepEpElasticRouter] COMBINE seq={seq2} ep_rank={self._ep_rank} "
+                    f"combined_x.shape={tuple(combined_x.shape)} nan={nan_cnt} inf={inf_cnt} "
+                    f"max_abs={max_abs:.4g} mean_abs={mean_abs:.4g} zero_frac={zero_frac:.3f}",
+                    flush=True,
+                )
+                DeepEpElasticRouter._combine_printed = n_p2 + 1
+
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)
+
+        # Isolation experiment: replace our combined_x with zeros to see
+        # whether NaN downstream comes from our values (then zeros should
+        # stop the cascade) or from the model itself (then zeros wouldn't
+        # help). Gated; default off.
+        if int(os.environ.get("DEEPEP_ELASTIC_FORCE_ZERO_OUTPUT", "0")):
+            if not getattr(DeepEpElasticRouter, "_logged_force_zero", False):
+                print(
+                    f"[DeepEpElasticRouter] FORCE_ZERO_OUTPUT enabled — "
+                    f"returning zeros instead of combined_x shape={tuple(combined_x.shape)}",
+                    flush=True,
+                )
+                DeepEpElasticRouter._logged_force_zero = True
+            combined_x = torch.zeros_like(combined_x)
+
         return combined_x
