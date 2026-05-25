@@ -292,54 +292,77 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         act_dtype = a1.dtype
 
-        # NaN-input guard (collective-safe, in-place sanitisation).
-        # Iter 9 diagnosis: the model produces NaN at layer 1 on
-        # rank 1 during engine init warmup (qwen35_moe has a known
-        # numerical edge case with the synthetic init input). Legacy
-        # DeepEP tolerates this silently — its dispatch doesn't
-        # assert on topk_idx duplicates. Elastic DeepEPv2 dispatch
-        # has `ptx::deduplicate(dst_expert_idx, lane_idx)` which
-        # fails when input is all-NaN → gate(NaN) → argmax(NaN) → 0
-        # → topk=[0,0,...,0] all duplicates.
+        # NaN-input guard (collective-safe, GPU-side sanitisation).
         #
-        # Mitigation: replace NaN-tainted inputs IN PLACE before
-        # dispatch — substitute zeros for `a1`, uniform 1/k for
-        # `topk_weights`, and a distinct round-robin id sequence
-        # for `topk_ids`. Dispatch is a collective operation, so we
-        # cannot early-return on a subset of ranks (that deadlocks
-        # the comm); we must call it on every rank with safe inputs.
-        # Default on; disable with =0 to expose the underlying NaN
-        # for model-side debugging.
+        # Background:
+        # qwen35_moe (and a few other DeepEP MoE models) produces NaN at
+        # layer 1 on some rank during engine init warmup (numerical edge
+        # case with the synthetic init input). Legacy DeepEP tolerates
+        # this silently. DeepEPv2 dispatch has
+        # `ptx::deduplicate(dst_expert_idx, lane_idx)` which asserts when
+        # input is all-NaN → gate(NaN) → argmax(NaN) → 0 → topk slots
+        # all-equal-zero, lane-level duplicates trip the assertion.
+        #
+        # Cuda graph friendliness:
+        # The previous implementation did `.any().item()` + Python
+        # `if tainted:` branch, which triggers a host sync and is
+        # forbidden inside `torch.cuda.graph()` capture. Rewritten in
+        # vLLM-style "unconditional `torch.where`" form (mirrors
+        # `vllm/v1/attention/ops/dcp_alltoall.py:65-87`):
+        # everything is GPU elementwise, no `.item() / .cpu()`, no
+        # Python branch, capturable. NaN-free inputs see only a few
+        # extra GPU elementwise nops; cost is negligible.
+        #
+        # Dispatch is a collective op, so we must apply the same
+        # sanitisation on every rank uniformly — done implicitly because
+        # this code runs on every rank with the same logic.
+        # Default on; disable with =0 to expose the underlying NaN for
+        # model-side debugging (will lose cuda-graph capture).
         nan_guard_active = int(os.environ.get("DEEPEP_ELASTIC_NAN_GUARD", "1"))
         if nan_guard_active:
-            tainted = bool(
-                torch.isnan(a1).any().item()
-                or torch.isnan(topk_weights).any().item()
+            # (1) hidden states: NaN → 0
+            a1 = torch.where(torch.isnan(a1), torch.zeros_like(a1), a1)
+
+            # (2) topk_weights: NaN → 1/k uniform
+            inv_k = 1.0 / float(self._num_topk)
+            topk_weights = torch.where(
+                torch.isnan(topk_weights),
+                torch.full_like(topk_weights, inv_k),
+                topk_weights,
             )
-            if tainted:
-                if not getattr(DeepEpElasticRouter, "_logged_nan_guard", False):
-                    print(
-                        f"[DeepEpElasticRouter] NAN_GUARD fired (rank "
-                        f"{self._ep_rank}) — sanitising NaN-tainted input "
-                        f"before dispatch (a1 → zeros, topk → "
-                        f"round-robin, weights → 1/k). Mirrors legacy "
-                        f"DeepEP silent-tolerance.",
-                        flush=True,
-                    )
-                    DeepEpElasticRouter._logged_nan_guard = True
-                a1 = torch.zeros_like(a1)
-                # Build distinct ids per row so ptx::deduplicate stays
-                # happy: row r, slot k → expert (r*num_topk + k) %
-                # num_experts. With num_topk <= num_experts (always
-                # true) the per-row k slots are guaranteed distinct.
+
+            # (3) topk_ids: DeepEPv2 dispatch's `ptx::deduplicate` fails
+            # when **any two slots in a row are equal** (not just when
+            # the whole row collapses to 0). NaN-tainted gate produces
+            # the most extreme case (all slots == 0) but capture warmup
+            # with zero hidden states can also produce mid-degree
+            # collisions (a few slots equal). Detect "row has any
+            # duplicate slot" GPU-side via sort + neighbor compare, and
+            # replace such rows with a round-robin id sequence so every
+            # slot within a row is distinct.
+            #
+            # GPU-only detection: torch.sort + neighbor equality + .any
+            # all return GPU tensors. No `.item() / .cpu()`. The
+            # `if topk_ids.size(1) > 1` guard reads tensor *metadata*
+            # (host const at trace time, folded by graph capture into
+            # a single branch), not data, so it's safe inside
+            # torch.cuda.graph().
+            if topk_ids.size(1) > 1:
                 rows = topk_ids.size(0)
-                k = topk_ids.size(1)
-                base = (
-                    torch.arange(rows, device=topk_ids.device).unsqueeze(1) * k
-                    + torch.arange(k, device=topk_ids.device).unsqueeze(0)
+                k_topk = topk_ids.size(1)
+                rr = (
+                    torch.arange(
+                        rows * k_topk,
+                        device=topk_ids.device,
+                        dtype=topk_ids.dtype,
+                    )
+                    % self._num_experts
+                ).reshape(rows, k_topk)
+                sorted_ids, _ = torch.sort(topk_ids, dim=-1)
+                has_dup = (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any(
+                    dim=-1, keepdim=True
                 )
-                topk_ids = (base % self._num_experts).to(topk_ids.dtype)
-                topk_weights = torch.full_like(topk_weights, 1.0 / float(k))
+                topk_ids = torch.where(has_dup, rr, topk_ids)
 
         # FULL_BYPASS: skip both dispatch and combine entirely. Pretend the
         # MoE produced zeros. Use to confirm whether the elastic kernel
