@@ -1,19 +1,28 @@
-"""DeepEPv2 ElasticBuffer-backed unified router (2D Contiguous only).
+"""DeepEPv2 ElasticBuffer-backed unified router (prefill + decode cudagraph).
 
 See ``集成方案/RTP集成DeepEPv2方案设计.md`` §B for the design rationale —
 this router replaces both ``DeepEpLowLatencyRouter`` and
-``DeepepNormalRouter`` when ``USE_DEEPEP_ELASTIC=1``. Only the
-``(do_expand=True, do_cpu_sync=True)`` 2D Contiguous ``[ΣN_e, hidden]``
-layout is supported, feeding the contiguous executors (TritonFusedMoe /
-DeepGemmHybrid / CutlassExperts* / TrtllmFp4).
+``DeepepNormalRouter`` when ``USE_DEEPEP_ELASTIC=1``.
 
-The 3D Batched (``do_cpu_sync=False``) path was removed: DeepEPv2 leaves
-``num_recv_tokens_per_expert_list`` empty in that mode and ``recv_x``
-stays compact 2D at offset 0, so the planned zero-copy
-``.view(E_local, M_max, hidden)`` reshape would read uninitialised memory
-for experts 1..E_local-1. See ``集成方案/BLOCKERS.md``. ``do_expand=False``
-is similarly fail-closed (rows are deduplicated by DeepEP, which no RTP
-executor can consume).
+Two ElasticBuffer dispatch modes are now supported:
+
+* **Prefill / default** — ``(do_expand=True, do_cpu_sync=True)`` → tight 2D
+  Contiguous ``[ΣN_e, hidden]`` layout, expert-grouped, feeds
+  ``CutlassExperts*`` / ``DeepGemmHybridExecutor`` / ``TritonFusedMoe`` /
+  ``TrtllmFp4Executor`` (the "contiguous" executor family).
+* **Decode cudagraph** — ``(do_expand=False, do_cpu_sync=False)`` →
+  ``[worst_case_N, hidden]`` in original token order with per-row
+  ``recv_topk_idx`` (``-1`` marks non-local / padding slots).  No D2H /
+  ``cudaStreamSynchronize`` happens on the GPU side, so the path is
+  CUDA Graph capture-friendly.  Mirrors vLLM ``DeepEPV2PrepareAndFinalize``
+  decode mode (PR #41183).
+
+Other ``(do_expand, do_cpu_sync)`` combinations stay fail-closed: mixed
+modes are not exercised by any DeepEPv2 caller we know of.  ``do_expand=
+False`` with ``do_cpu_sync=True`` returns deduplicated rows that no RTP
+executor can consume; ``do_expand=True`` with ``do_cpu_sync=False`` leaves
+``num_recv_tokens_per_expert_list`` empty while still expecting per-expert
+slicing.
 """
 
 import os
@@ -59,11 +68,24 @@ def _is_elastic_enabled() -> bool:
 class DeepEpElasticRouter(FusedMoeDataRouter):
     """Unified DeepEPv2 ElasticBuffer dispatch/combine router.
 
-    Only ``do_expand=True``/``do_cpu_sync=True`` (2D Contiguous,
-    ``[ΣN_e, hidden]``) is supported — a drop-in for the contiguous
-    executors (``DeepGemmHybridExecutor`` / ``TritonFusedMoeExecutor`` /
-    ``CutlassExperts*`` / ``TrtllmFp4Executor``). Other env combinations
-    are fail-closed in ``__init__``.
+    Two layouts are supported, selected by env at construction time
+    (defaults stay on prefill so legacy callers see no behavioural change):
+
+    * ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` (default)
+      → 2D Contiguous ``[ΣN_e, hidden]``, expert-grouped, drop-in for
+      ``DeepGemmHybridExecutor`` / ``TritonFusedMoeExecutor`` /
+      ``CutlassExperts*`` / ``TrtllmFp4Executor``.
+    * ``DEEPEP_ELASTIC_DO_EXPAND=0, DEEPEP_ELASTIC_DO_CPU_SYNC=0``
+      → vLLM-style decode cudagraph: ``[worst_case_N, hidden]`` in
+      original token order, per-row ``recv_topk_idx`` with ``-1`` for
+      non-local / padding slots, ``expert_tokens_meta=None``.  Pairs with
+      executors that natively guard ``topk_idx == -1`` inside their GPU
+      kernels (``CutlassExpertsFp8`` / ``CutlassExpertsW4a8Int4PerChannel``
+      / ``DeepGemmMaskedExecutorV2``).
+
+    Mixed combinations (``(True, False)`` / ``(False, True)``) remain
+    fail-closed in ``__init__`` — DeepEPv2 has no caller for them and
+    silently produces inconsistent metadata in either direction.
     """
 
     @classmethod
@@ -134,24 +156,29 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         self._do_expand: bool = deepep_config.elastic_do_expand
         self._do_cpu_sync: bool = deepep_config.elastic_do_cpu_sync
-        # Strategy layer already fail-closes on do_expand=False / do_cpu_sync=False
-        # (only the 2D Contiguous variants are registered). These asserts are
-        # defense-in-depth against direct instantiation with invalid env
-        # combinations.
-        assert self._do_expand, (
-            "DeepEpElasticRouter requires DEEPEP_ELASTIC_DO_EXPAND=1; "
-            "do_expand=False returns deduplicated rows that no RTP "
-            "executor can consume."
+        # Strategy layer fail-closes on mismatched combinations (only the
+        # ``*EpElasticContiguousStrategy`` and ``*EpElasticDecodeStrategy``
+        # subclasses are registered). This assert is defense-in-depth
+        # against direct instantiation with invalid env combinations.
+        # Two layouts are supported:
+        #   (True,  True)  → 2D Contiguous prefill (default)
+        #   (False, False) → vLLM-style decode cudagraph
+        # Mixed combinations have no caller and would produce inconsistent
+        # metadata (e.g. empty num_recv_tokens_per_expert_list with
+        # expand=True, deduplicated rows with cpu_sync=True).
+        assert (self._do_expand and self._do_cpu_sync) or (
+            (not self._do_expand) and (not self._do_cpu_sync)
+        ), (
+            "DeepEpElasticRouter supports two layouts: prefill "
+            "(DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1) and "
+            "decode cudagraph (DEEPEP_ELASTIC_DO_EXPAND=0, "
+            "DEEPEP_ELASTIC_DO_CPU_SYNC=0). Got do_expand="
+            f"{self._do_expand}, do_cpu_sync={self._do_cpu_sync}. Mixed "
+            "combinations are fail-closed because DeepEPv2 produces "
+            "inconsistent metadata in those modes."
         )
-        assert self._do_cpu_sync, (
-            "DEEPEP_ELASTIC_DO_CPU_SYNC=0 is unsupported in the current "
-            "integration: DeepEPv2 leaves num_recv_tokens_per_expert_list "
-            "empty in that mode (psum_num_recv_tokens_per_expert is the "
-            "only ground truth) and recv_x stays compact 2D at offset 0, "
-            "so the planned 3D .view(E_local, M_max, hidden) reshape would "
-            "read uninitialised memory for experts 1..E_local-1. See "
-            "deepep integration BLOCKERS.md."
-        )
+        # True iff the (False, False) decode cudagraph path is in effect.
+        self._use_decode_cudagraph: bool = not self._do_cpu_sync
 
         wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert wrapper.mode == DeepEPMode.ELASTIC, (
@@ -438,6 +465,51 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             expert_x, expert_x_scale = recv_x
         else:
             expert_x, expert_x_scale = recv_x, None
+
+        if self._use_decode_cudagraph:
+            # vLLM-style (False, False) decode cudagraph path. ElasticBuffer
+            # returns:
+            #   recv_x: [worst_case_N, hidden] (or (fp8, sf) tuple) in
+            #     ORIGINAL token order — not expert-grouped, may include
+            #     non-local rows and worst-case padding whose contents are
+            #     untouched
+            #   recv_topk_idx: [worst_case_N, num_topk] of LOCAL expert IDs
+            #     with -1 marking non-local / padding slots
+            #   recv_topk_weights: [worst_case_N, num_topk] aligned with
+            #     recv_topk_idx
+            #   handle.num_recv_tokens_per_expert_list: empty list (push
+            #     happens only when do_cpu_sync=True, see
+            #     DeepEP/csrc/elastic/buffer.hpp:1003-1008)
+            #
+            # Two cudagraph invariants must be preserved here:
+            #   1. NO ``.item() / .cpu() / .tolist()`` — would break capture
+            #   2. ``expert_tokens_meta=None`` — passing it with a non-None
+            #      ``expert_num_tokens_cpu`` would trigger
+            #      ``cutlass_moe.py:128-131`` D2H even though the downstream
+            #      kernel never needs it (cf. vLLM ``deepep_v2.py``
+            #      docstring "Expert kernel sorts internally").
+            assert recv_topk_idx is not None, (
+                "(False, False) dispatch must return per-row recv_topk_idx, "
+                "got None — ElasticBuffer contract violation."
+            )
+            # Local → global expert ID; -1 stays -1 so downstream kernels
+            # (CutlassExpertsFp8 / W4a8 ``torch.where(!= -1, ..., E)`` +
+            # DeepGemmMaskedExecutorV2 ``ep_scatter_v2`` per-row guard at
+            # ep_kernels.py:245) skip the row without scribbling on it.
+            valid_mask = recv_topk_idx >= 0
+            expert_topk_ids = torch.where(
+                valid_mask,
+                recv_topk_idx + self._rank_expert_offset,
+                recv_topk_idx,
+            )
+            return ExpertForwardPayload(
+                expert_x=expert_x,
+                expert_x_scale=expert_x_scale,
+                expert_x_origin_dtype=act_dtype,
+                expert_topk_ids=expert_topk_ids,
+                expert_topk_weights=recv_topk_weights,
+                expert_tokens_meta=None,
+            )
 
         num_per_expert = handle.num_recv_tokens_per_expert_list
         # ElasticBuffer returns an empty list when 0 tokens were dispatched

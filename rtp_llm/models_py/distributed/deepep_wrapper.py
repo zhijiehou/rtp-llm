@@ -102,10 +102,21 @@ class DeepepWrapperConfig:
     elastic_prefer_overlap_with_compute: bool = True
     elastic_allow_multiple_reduction: bool = False
     # DeepEP dispatch native API parameters (decoupled from
-    # USE_DEEPEP_LOW_LATENCY). Default (True, True) reproduces the 2D
-    # Contiguous path used in production. (True, False) selects the 3D
-    # Batched path (per-expert M_max blocks). (False, *) is rejected by
-    # the strategy layer.
+    # USE_DEEPEP_LOW_LATENCY). Two layouts are supported:
+    #   (True,  True)  → 2D Contiguous prefill (default). Expert-grouped
+    #     [ΣN_e, hidden] layout; feeds the "contiguous" executor family
+    #     (DeepGemmHybrid / CutlassExperts* / TritonFused / TrtllmFp4).
+    #     Drives *EpElasticContiguousStrategy.
+    #   (False, False) → vLLM-style decode cudagraph path. Original token
+    #     order [worst_case_N, hidden]; per-row recv_topk_idx with -1 for
+    #     non-local / padding rows. No host-side cudaStreamSynchronize, so
+    #     CUDA Graph capture-friendly. Drives *EpElasticDecodeStrategy
+    #     (fp8_per_tensor / w4a8_int4_per_channel / fp8_per_block only —
+    #     no_quant is excluded because TritonFusedMoeExecutor's
+    #     moe_align_block_size silently maps -1 → expert 0).
+    # Mixed combinations (True, False) / (False, True) are rejected by the
+    # router __init__ assertion — DeepEPv2 returns inconsistent metadata
+    # in those modes (see deepep_elastic_router.py docstring).
     elastic_do_expand: bool = True
     elastic_do_cpu_sync: bool = True
     # Baked from quant_config.get_method() to keep equal() comparable without

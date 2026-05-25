@@ -33,3 +33,15 @@ py_test (
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20', 'gpu_count':'2'},
 )
+
+py_test (
+    name = "deepep_elastic_router_cudagraph_smoke_test",
+    srcs = ["deepep_elastic_router_cudagraph_smoke_test.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm/models_py/distributed:collective_torch"
+    ],
+    env = {"GPU_COUNT": "2", "USE_DEEPEP_ELASTIC": "1"},
+    tags = ["open_skip", "H20"],
+    exec_properties = {'gpu':'H20', 'gpu_count':'2'},
+)
