@@ -502,6 +502,13 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         if isinstance(recv_x, tuple):
             expert_x, expert_x_scale = recv_x
+            if (
+                expert_x_scale is not None
+                and self.quant_config.is_per_act_token
+                and expert_x_scale.dim() == 2
+                and expert_x_scale.size(1) > 1
+            ):
+                expert_x_scale = expert_x_scale[:, 0].contiguous()
         else:
             expert_x, expert_x_scale = recv_x, None
 
