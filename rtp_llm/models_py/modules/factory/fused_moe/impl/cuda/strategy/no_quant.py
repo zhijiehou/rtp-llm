@@ -87,6 +87,47 @@ class CudaNoQuantEpElasticContiguousStrategy(MoeStrategy):
         )
 
 
+class CudaNoQuantEpElasticDecodeStrategy(MoeStrategy):
+    """CUDA EP elastic decode cudagraph bf16/fp16 strategy (no quantization).
+
+    Selected when ``USE_DEEPEP_ELASTIC=1`` with
+    ``DEEPEP_ELASTIC_DO_EXPAND=0, DEEPEP_ELASTIC_DO_CPU_SYNC=0``. Pairs the
+    elastic router decode-mode layout (``[worst_case_N, hidden]`` + per-row
+    ``recv_topk_idx`` with ``-1`` sentinels) with ``TritonFusedMoeExecutor``.
+
+    The router maps ``-1`` to a dummy expert (weight=0) so the executor
+    never sees invalid IDs.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method is None)
+        do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
+        do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
+        checker.check((not do_expand) and (not do_cpu_sync))
+        checker.check(
+            config.moe_strategy == "no_quant_ep_elastic_decode"
+            or config.moe_strategy == "auto"
+        )
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.triton_fused_executor import (
+            TritonFusedMoeExecutor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_elastic_router import (
+            DeepEpElasticRouter,
+        )
+
+        quant_config = FusedMoEQuantConfig(quant_dtype=None)
+        return StrategyAttributes(
+            router_class=DeepEpElasticRouter,
+            executor_class=TritonFusedMoeExecutor,
+            quant_config=quant_config,
+        )
+
+
 class CudaNoQuantCppStrategy(MoeStrategy):
     """CUDA CPP mode without quantization strategy"""
 

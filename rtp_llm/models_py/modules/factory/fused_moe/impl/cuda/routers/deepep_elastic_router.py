@@ -541,11 +541,10 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             if self._use_local_expert_ids:
                 expert_topk_ids = recv_topk_idx
             else:
-                valid_mask = recv_topk_idx >= 0
                 expert_topk_ids = torch.where(
-                    valid_mask,
+                    recv_topk_idx == -1,
+                    self._num_experts - 1 if self._rank_expert_offset == 0 else 0,
                     recv_topk_idx + self._rank_expert_offset,
-                    recv_topk_idx,
                 )
             return ExpertForwardPayload(
                 expert_x=expert_x,

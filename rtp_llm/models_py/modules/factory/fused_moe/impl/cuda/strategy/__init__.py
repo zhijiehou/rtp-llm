@@ -26,6 +26,7 @@ from .no_quant import (
     CudaNoQuantCppStrategy,
     CudaNoQuantDpNormalStrategy,
     CudaNoQuantEpElasticContiguousStrategy,
+    CudaNoQuantEpElasticDecodeStrategy,
     CudaNoQuantEpLowLatencyStrategy,
 )
 from .fp4 import (CudaFp4EpElasticContiguousStrategy,
@@ -40,6 +41,7 @@ __all__ = [
     "CudaNoQuantCppStrategy",
     "CudaNoQuantDpNormalStrategy",
     "CudaNoQuantEpElasticContiguousStrategy",
+    "CudaNoQuantEpElasticDecodeStrategy",
     # FP8 PerBlock
     "CudaFp8PerBlockNoDPMaskedStrategy",
     "CudaFp8PerBlockNoDPStrategy",
