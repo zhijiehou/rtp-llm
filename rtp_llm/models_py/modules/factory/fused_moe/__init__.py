@@ -78,6 +78,7 @@ else:
         CudaNoQuantCppStrategy,
         CudaNoQuantDpNormalStrategy,
         CudaNoQuantEpElasticContiguousStrategy,
+        CudaNoQuantEpElasticDecodeStrategy,
         CudaNoQuantEpLowLatencyStrategy,
         CudaW4a8Int4PerChannelEpElasticContiguousStrategy,
         CudaW4a8Int4PerChannelEpElasticDecodeStrategy,
@@ -122,11 +123,10 @@ else:
     #       (fp8_per_block — picks V2 over Hybrid to skip the
     #       execute_contiguous L400-401 D2H sanity asserts).
     #
-    # Decode-mode coverage is intentionally narrower than contiguous:
-    # no_quant (TritonFused clamp silently maps -1 → expert 0) and
-    # fp4 (flashinfer trtllm fp4 -1 handling unverified) stay off until
-    # the underlying kernels are audited.
+    # Decode-mode coverage: no_quant handles -1 in Router (mapped to
+    # dummy expert); fp4 stays off until flashinfer -1 handling is audited.
     registry.register(CudaNoQuantEpElasticContiguousStrategy())
+    registry.register(CudaNoQuantEpElasticDecodeStrategy())
     registry.register(CudaFp8PerBlockEpElasticContiguousStrategy())
     registry.register(CudaFp8PerBlockEpElasticDecodeStrategy())
     registry.register(CudaFp8PerTensorEpElasticContiguousStrategy())
