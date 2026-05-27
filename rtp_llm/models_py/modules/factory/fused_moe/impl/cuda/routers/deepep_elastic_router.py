@@ -133,6 +133,12 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             quant_config.is_quantized
             and quant_config.quant_dtype == torch.float8_e4m3fn
         )
+        self._use_fp4: bool = (
+            MoeConfigResolver().get_quant_method(config) == "modelopt_fp4"
+        )
+        self._use_local_expert_ids: bool = (
+            self._use_fp8_dispatch or self._use_fp4
+        )
         self._expert_alignment: int = 128 if quant_config.is_block_quantized else 1
 
         # Layout is exclusively driven by DEEPEP_ELASTIC_DO_EXPAND and
@@ -227,6 +233,16 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         self, a1: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """FP8 on-line quant. Mirrors DeepepNormalRouterBase._do_quant."""
+        if a1.size(0) == 0:
+            hidden = a1.size(1)
+            a1_q = torch.empty(
+                (0, hidden), dtype=torch.float8_e4m3fn, device=a1.device
+            )
+            scale_cols = hidden // 128 if hidden >= 128 else 1
+            a1_scale = torch.empty(
+                (0, scale_cols), dtype=torch.float32, device=a1.device
+            )
+            return a1_q, a1_scale
         if self.quant_config.is_block_quantized:
             if is_deep_gemm_e8m0_used():
                 return sgl_per_token_group_quant_fp8(
@@ -515,16 +531,15 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 "(False, False) dispatch must return per-row recv_topk_idx, "
                 "got None — ElasticBuffer contract violation."
             )
-            # Local → global expert ID; -1 stays -1 so downstream kernels
-            # (CutlassExpertsFp8 / W4a8 ``torch.where(!= -1, ..., E)`` +
-            # DeepGemmMaskedExecutorV2 ``ep_scatter_v2`` per-row guard at
-            # ep_kernels.py:245) skip the row without scribbling on it.
-            valid_mask = recv_topk_idx >= 0
-            expert_topk_ids = torch.where(
-                valid_mask,
-                recv_topk_idx + self._rank_expert_offset,
-                recv_topk_idx,
-            )
+            if self._use_local_expert_ids:
+                expert_topk_ids = recv_topk_idx
+            else:
+                valid_mask = recv_topk_idx >= 0
+                expert_topk_ids = torch.where(
+                    valid_mask,
+                    recv_topk_idx + self._rank_expert_offset,
+                    recv_topk_idx,
+                )
             return ExpertForwardPayload(
                 expert_x=expert_x,
                 expert_x_scale=expert_x_scale,
@@ -561,16 +576,15 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         #   recv_topk_idx        = None
         #   recv_topk_weights    = (N_recv,)   (1D, one weight per slot)
         #   num_recv_per_expert  = list[E_local]  (cumsum gives slot ranges)
-        # Synthesize per-row `expert_topk_ids` (global id, shape
+        # Synthesize per-row `expert_topk_ids` (local or global id, shape
         # `[N_recv, 1]`) from the per-expert count and reshape weights
         # to `[N_recv, 1]` so the contiguous executors see a
         # self-consistent `num_topk=1` layout.
         if recv_topk_idx is None:
+            eid_offset = 0 if self._use_local_expert_ids else self._rank_expert_offset
             offsets = []
             for local_eid, cnt in enumerate(num_per_expert):
-                offsets.extend(
-                    [self._rank_expert_offset + local_eid] * int(cnt)
-                )
+                offsets.extend([eid_offset + local_eid] * int(cnt))
             if offsets:
                 expert_topk_ids = torch.tensor(
                     offsets, device=expert_x.device, dtype=torch.int64
@@ -580,11 +594,14 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                     (0, 1), device=expert_x.device, dtype=torch.int64
                 )
         else:
-            expert_topk_ids = torch.where(
-                recv_topk_idx == -1,
-                self._num_experts - 1 if self._rank_expert_offset == 0 else 0,
-                recv_topk_idx + self._rank_expert_offset,
-            )
+            if self._use_local_expert_ids:
+                expert_topk_ids = recv_topk_idx
+            else:
+                expert_topk_ids = torch.where(
+                    recv_topk_idx == -1,
+                    self._num_experts - 1 if self._rank_expert_offset == 0 else 0,
+                    recv_topk_idx + self._rank_expert_offset,
+                )
 
         if recv_topk_weights is not None and recv_topk_weights.dim() == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
