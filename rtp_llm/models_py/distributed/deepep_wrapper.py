@@ -731,24 +731,48 @@ class DeepEPWrapper:
         # The previous version used config.ll_num_max_token for normal style,
         # which left buffers undersized (causes the elastic kernel to read
         # uninitialised slots and trip ptx::deduplicate downstream).
-        if config.use_deepep_low_latency:
-            num_max_tokens_per_rank = config.ll_num_max_token_per_rank
+        is_decode_path = config.use_deepep_low_latency or (
+            not config.elastic_do_expand and not config.elastic_do_cpu_sync
+        )
+        if is_decode_path:
+            if config.ll_num_max_token_per_rank > 0:
+                num_max_tokens_per_rank = config.ll_num_max_token_per_rank
+                _src = "config.ll_num_max_token_per_rank (pre-computed)"
+            else:
+                num_max_tokens_per_rank = DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
+                    config.ll_num_max_token, config.tp_size, None
+                )
+                _src = (
+                    f"calc_low_latency_max_token_per_rank("
+                    f"ll_num_max_token={config.ll_num_max_token}, "
+                    f"tp_size={config.tp_size})"
+                )
+            if config.local_rank == 0:
+                print(
+                    f"[DeepEP][INIT] Decode path selected: "
+                    f"use_deepep_low_latency={config.use_deepep_low_latency}, "
+                    f"do_expand={config.elastic_do_expand}, "
+                    f"do_cpu_sync={config.elastic_do_cpu_sync}, "
+                    f"num_max_tokens_per_rank={num_max_tokens_per_rank} "
+                    f"(source: {_src})",
+                    flush=True,
+                )
         else:
             assert (
                 config.max_seq_len > 0 and config.tp_size > 0
             ), f"normal-style elastic needs max_seq_len/tp_size, got {config.max_seq_len}/{config.tp_size}"
-            # In theory the worst-case per-rank dispatch input is
-            # max_seq_len/tp_size (a single full-context prefill). In
-            # practice the scheduler chunks prefill into ~thousands of
-            # tokens, and ElasticBuffer allocates
-            # `num_max_tokens_per_rank * hidden * num_topk * sizeof(bf16)`
-            # — at MAX_SEQ_LEN=262144/TP=1/hidden=2048/topk=8 that's 8 GB
-            # per buffer per rank, blowing past the 95 GB GPU after model
-            # weights + KV cache. Cap so we trade "worst-case correctness"
-            # for OOM safety; env override is provided.
             raw = (config.max_seq_len + config.tp_size - 1) // config.tp_size
             cap = int(os.environ.get("DEEPEP_ELASTIC_MAX_TOKENS_PER_RANK", "8192"))
             num_max_tokens_per_rank = min(raw, cap) if cap > 0 else raw
+            if config.local_rank == 0:
+                print(
+                    f"[DeepEP][INIT] Prefill path selected: "
+                    f"do_expand={config.elastic_do_expand}, "
+                    f"do_cpu_sync={config.elastic_do_cpu_sync}, "
+                    f"raw={raw}, cap={cap}, "
+                    f"num_max_tokens_per_rank={num_max_tokens_per_rank}",
+                    flush=True,
+                )
 
         if config.local_rank == 0:
             print(
