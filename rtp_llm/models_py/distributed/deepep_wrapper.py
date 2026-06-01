@@ -694,7 +694,7 @@ class DeepEPWrapper:
 
         config = self._config
         is_decode_path = config.use_deepep_low_latency or (
-            not config.elastic_do_expand and not config.elastic_do_cpu_sync
+            not config.elastic_do_cpu_sync
         )
         if is_decode_path:
             if config.ll_num_max_token_per_rank > 0:

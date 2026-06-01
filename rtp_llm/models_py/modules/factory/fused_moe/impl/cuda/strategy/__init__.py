@@ -1,6 +1,7 @@
 """CUDA MOE strategies"""
 
 from .fp8_per_block import (
+    CudaFp8PerBlockEpElasticContiguousCudaGraphStrategy,
     CudaFp8PerBlockEpElasticContiguousStrategy,
     CudaFp8PerBlockEpElasticDecodeStrategy,
     CudaFp8PerBlockEpLowLatencyStrategy,
@@ -43,6 +44,7 @@ __all__ = [
     "CudaFp8PerBlockEpLowLatencyStrategy",
     "CudaFp8PerBlockEpNormalStrategy",
     "CudaFp8PerBlockEpElasticContiguousStrategy",
+    "CudaFp8PerBlockEpElasticContiguousCudaGraphStrategy",
     "CudaFp8PerBlockEpElasticDecodeStrategy",
     # FP8 PerTensor
     "CudaFp8PerTensorNoDPStrategy",

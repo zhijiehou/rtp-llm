@@ -109,16 +109,16 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         self._do_expand: bool = deepep_config.elastic_do_expand
         self._do_cpu_sync: bool = deepep_config.elastic_do_cpu_sync
-        assert (self._do_expand and self._do_cpu_sync) or (
-            (not self._do_expand) and (not self._do_cpu_sync)
-        ), (
-            "DeepEpElasticRouter supports two layouts: prefill "
-            "(DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1) and "
-            "decode cudagraph (DEEPEP_ELASTIC_DO_EXPAND=0, "
-            "DEEPEP_ELASTIC_DO_CPU_SYNC=0). Got do_expand="
-            f"{self._do_expand}, do_cpu_sync={self._do_cpu_sync}."
+        assert not (not self._do_expand and self._do_cpu_sync), (
+            "DeepEpElasticRouter: (do_expand=False, do_cpu_sync=True) is not supported. "
+            f"Got do_expand={self._do_expand}, do_cpu_sync={self._do_cpu_sync}."
         )
-        self._use_decode_cudagraph: bool = not self._do_cpu_sync
+        self._use_decode_cudagraph: bool = (
+            not self._do_expand and not self._do_cpu_sync
+        )
+        self._use_contiguous_cudagraph: bool = (
+            self._do_expand and not self._do_cpu_sync
+        )
 
         wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert wrapper.mode == DeepEPMode.ELASTIC, (
@@ -324,6 +324,23 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 expert_topk_ids=expert_topk_ids,
                 expert_topk_weights=recv_topk_weights,
                 expert_tokens_meta=None,
+            )
+
+        if self._use_contiguous_cudagraph:
+            psum = handle.psum_num_recv_tokens_per_expert
+
+            if recv_topk_weights is not None and recv_topk_weights.dim() == 1:
+                recv_topk_weights = recv_topk_weights.unsqueeze(1)
+
+            return ExpertForwardPayload(
+                expert_x=expert_x,
+                expert_x_scale=expert_x_scale,
+                expert_x_origin_dtype=act_dtype,
+                expert_topk_ids=None,
+                expert_topk_weights=recv_topk_weights,
+                expert_tokens_meta=ExpertTokensMetadata(
+                    expert_psum=psum,
+                ),
             )
 
         num_per_expert = handle.num_recv_tokens_per_expert_list

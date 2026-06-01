@@ -313,3 +313,43 @@ class CudaFp8PerBlockEpElasticDecodeStrategy(MoeStrategy):
             executor_class=DeepGemmMaskedExecutorV2,
             quant_config=quant_config,
         )
+
+
+class CudaFp8PerBlockEpElasticContiguousCudaGraphStrategy(MoeStrategy):
+    """CUDA FP8 PerBlock EP elastic contiguous cudagraph strategy.
+
+    Selected when ``USE_DEEPEP_ELASTIC=1`` with
+    ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=0``.
+    Uses contiguous GEMM with GPU-side psum, no D2H, CUDA Graph safe.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "FP8_PER_BLOCK")
+        do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
+        do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
+        checker.check(do_expand and (not do_cpu_sync))
+        checker.check(
+            config.moe_strategy == "fp8_per_block_ep_elastic_contiguous_cudagraph"
+            or config.moe_strategy == "auto"
+        )
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_contiguous_executor_v2 import (
+            DeepGemmContiguousExecutorV2,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_elastic_router import (
+            DeepEpElasticRouter,
+        )
+
+        quant_config = FusedMoEQuantConfig(
+            quant_dtype=torch.float8_e4m3fn,
+            block_shape=[128, 128],
+        )
+        return StrategyAttributes(
+            router_class=DeepEpElasticRouter,
+            executor_class=DeepGemmContiguousExecutorV2,
+            quant_config=quant_config,
+        )

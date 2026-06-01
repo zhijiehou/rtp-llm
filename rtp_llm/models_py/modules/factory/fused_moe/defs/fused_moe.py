@@ -25,6 +25,7 @@ class ExpertTokensMetadata:
     expected_m: Optional[int] = None
     expert_num_tokens: Optional[torch.Tensor] = None
     expert_num_tokens_cpu: Optional[Union[List[int], torch.Tensor]] = None
+    expert_psum: Optional[torch.Tensor] = None
 
 
 @dataclass

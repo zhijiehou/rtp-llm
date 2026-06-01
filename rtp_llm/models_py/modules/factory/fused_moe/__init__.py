@@ -64,6 +64,7 @@ else:
 
     # MoE strategies
     from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
+        CudaFp8PerBlockEpElasticContiguousCudaGraphStrategy,
         CudaFp8PerBlockEpElasticContiguousStrategy,
         CudaFp8PerBlockEpElasticDecodeStrategy,
         CudaFp8PerBlockPureCPStrategy,
@@ -102,6 +103,7 @@ else:
     registry.register(CudaW4a8Int4PerChannelNoDPStrategy())
     # DeepEPv2 elastic variants — only fp8_per_block is supported.
     registry.register(CudaFp8PerBlockEpElasticContiguousStrategy())
+    registry.register(CudaFp8PerBlockEpElasticContiguousCudaGraphStrategy())
     registry.register(CudaFp8PerBlockEpElasticDecodeStrategy())
     # Only register FP4 strategies on SM_100+ (and only if CUDA GPU is available)
     if torch.cuda.is_available() and is_cuda() and get_sm()[0] >= 10:
