@@ -426,6 +426,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         else:
             x_payload = tp_a1
 
+        _elastic_num_sms = int(os.environ.get("DEEPEP_ELASTIC_NUM_SMS", "0"))
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = (
             self._buffer.dispatch(
                 x=x_payload,
@@ -433,13 +434,9 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 topk_weights=tp_topk_weights,
                 num_experts=self._num_experts,
                 expert_alignment=self._expert_alignment,
+                num_sms=_elastic_num_sms,
                 do_expand=self._do_expand,
                 do_cpu_sync=self._do_cpu_sync,
-                # Use async-with-compute-stream so dispatch returns a real
-                # CUDA event we can wait on. async_with_compute_stream=False
-                # ran dispatch on a separate comm stream without capturing
-                # an event, leaving downstream reads racing against in-
-                # flight writes — see iter 3 anomaly trap diagnosis.
                 async_with_compute_stream=True,
             )
         )
@@ -697,10 +694,12 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         # row already carries its own (token, expert) identity — weights are
         # baked into the per-expert layout and combine performs a simple
         # gather, not a topk reduction, so topk_weights=None.
+        _elastic_num_sms = int(os.environ.get("DEEPEP_ELASTIC_NUM_SMS", "0"))
         combined_x, _, combine_event = self._buffer.combine(
             x=x,
             handle=self._handle,
             topk_weights=None,
+            num_sms=_elastic_num_sms,
             async_with_compute_stream=True,
         )
         if (
