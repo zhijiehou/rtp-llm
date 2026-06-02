@@ -30,6 +30,9 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
 )
+from rtp_llm.models_py.modules.factory.fused_moe.utils.latency_tracker import (
+    DeepEPLatencyTracker,
+)
 from rtp_llm.models_py.utils.arch import get_sm
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
 
@@ -128,6 +131,11 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         )
         self._buffer = wrapper.elastic_buffer
         self._handle: Optional[Any] = None
+        self._tracker = DeepEPLatencyTracker("DeepEP-Elastic")
+
+    @property
+    def tracker(self):
+        return self._tracker if self._tracker.enabled else None
 
     @property
     def handle(self) -> Optional[Any]:
@@ -209,6 +217,11 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             combined_x = gathered[:original_num_tokens, :]
         return combined_x
 
+    def _gpu_event(self) -> torch.cuda.Event:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -217,6 +230,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> ExpertForwardPayload:
+        _prof = self._tracker.enabled
         assert self._handle is None, "elastic EPHandle leaked from previous step"
         if a1_scale is not None or a2_scale is not None:
             raise ValueError(
@@ -225,6 +239,9 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             )
 
         act_dtype = a1.dtype
+
+        if _prof:
+            _e0 = self._gpu_event()
 
         # NaN guard: qwen35_moe produces NaN at layer 1 during init warmup,
         # which triggers DeepEPv2 dispatch ptx::deduplicate assertion.
@@ -259,6 +276,9 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 )
                 topk_ids = torch.where(has_dup, rr, topk_ids)
 
+        if _prof:
+            _e1 = self._gpu_event()
+
         tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(
             a1, topk_ids, topk_weights
         )
@@ -275,7 +295,11 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         else:
             x_payload = tp_a1
 
+        if _prof:
+            _e2 = self._gpu_event()
+
         _elastic_num_sms = int(os.environ.get("DEEPEP_ELASTIC_NUM_SMS", "0"))
+        self._tracker.mark_dispatch_start(tp_a1.size(0))
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = (
             self._buffer.dispatch(
                 x=x_payload,
@@ -291,7 +315,11 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         )
         if event is not None and getattr(event, "event", None) is not None:
             event.current_stream_wait()
+        self._tracker.mark_dispatch_end()
         self._handle = handle
+
+        if _prof:
+            _e3 = self._gpu_event()
 
         if isinstance(recv_x, tuple):
             expert_x, expert_x_scale = recv_x
@@ -396,6 +424,34 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             expert_num_tokens_cpu=num_per_expert,
         )
 
+        if _prof:
+            _e4 = self._gpu_event()
+            torch.cuda.synchronize()
+            if not hasattr(self, '_prof_step'):
+                self._prof_step = 0
+                self._prof_nan_guard = 0.0
+                self._prof_tp_quant = 0.0
+                self._prof_dispatch_gpu = 0.0
+                self._prof_post_dispatch = 0.0
+            self._prof_nan_guard += _e0.elapsed_time(_e1) * 1000
+            self._prof_tp_quant += _e1.elapsed_time(_e2) * 1000
+            self._prof_dispatch_gpu += _e2.elapsed_time(_e3) * 1000
+            self._prof_post_dispatch += _e3.elapsed_time(_e4) * 1000
+            self._prof_step += 1
+            if self._prof_step % self._tracker._log_interval == 0:
+                import torch.distributed as _dist
+                _r = _dist.get_rank() if _dist.is_initialized() else 0
+                _n = self._prof_step
+                print(
+                    f"[Elastic-GPU-Detail rank={_r}] steps={_n} | "
+                    f"nan_guard={self._prof_nan_guard/_n:.0f}us | "
+                    f"tp+quant={self._prof_tp_quant/_n:.0f}us | "
+                    f"dispatch_gpu={self._prof_dispatch_gpu/_n:.0f}us | "
+                    f"post_dispatch={self._prof_post_dispatch/_n:.0f}us | "
+                    f"sum={int((self._prof_nan_guard+self._prof_tp_quant+self._prof_dispatch_gpu+self._prof_post_dispatch)/_n)}us",
+                    flush=True,
+                )
+
         return ExpertForwardPayload(
             expert_x=expert_x,
             expert_x_scale=expert_x_scale,
@@ -424,6 +480,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         ), f"ElasticBuffer.combine requires bfloat16 input, got {x.dtype}"
 
         _elastic_num_sms = int(os.environ.get("DEEPEP_ELASTIC_NUM_SMS", "0"))
+        self._tracker.mark_combine_start()
         combined_x, _, combine_event = self._buffer.combine(
             x=x,
             handle=self._handle,
@@ -436,6 +493,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             and getattr(combine_event, "event", None) is not None
         ):
             combine_event.current_stream_wait()
+        self._tracker.mark_combine_end()
         self._handle = None
 
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)

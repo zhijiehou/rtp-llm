@@ -83,6 +83,10 @@ class FusedMoeDataRouter(ABC):
         """
         raise NotImplementedError
 
+    @property
+    def tracker(self):
+        return None
+
     @abstractmethod
     def prepare(
         self,
@@ -190,6 +194,10 @@ class FusedMoe(torch.nn.Module):
     ) -> torch.Tensor:
 
         a1 = hidden_states
+        _tracker = self.router.tracker
+
+        if _tracker:
+            _tracker.mark_forward_start()
 
         expert_payload = self.router.prepare(
             a1,
@@ -198,6 +206,9 @@ class FusedMoe(torch.nn.Module):
             topk_weights,
             topk_ids,
         )
+
+        if _tracker:
+            _tracker.mark_prepare_end()
 
         if expert_payload.expert_topk_ids is None:
             expert_payload.expert_topk_ids = topk_ids
@@ -226,6 +237,9 @@ class FusedMoe(torch.nn.Module):
                 extra_expert_args=extra_expert_args,
             )
 
+        if _tracker:
+            _tracker.mark_execute_end()
+
         # pass a1.shape to finalize for shape check
         if extra_finalize_args is None:
             extra_finalize_args = {"a1_shape": a1.shape}
@@ -241,6 +255,9 @@ class FusedMoe(torch.nn.Module):
             apply_router_weight_on_input,
             extra_finalize_args,
         )
+
+        if _tracker:
+            _tracker.mark_forward_end()
 
         assert (
             output.shape == hidden_states.shape

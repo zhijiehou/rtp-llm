@@ -23,6 +23,9 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
+from rtp_llm.models_py.modules.factory.fused_moe.utils.latency_tracker import (
+    DeepEPLatencyTracker,
+)
 from rtp_llm.models_py.utils.arch import get_sm
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
@@ -92,6 +95,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         self._opt_level = int(os.environ.get("ACCL_LOW_LATENCY_OPTIMIZE", 1))
         self._handle: Optional[Tuple[Any, ...]] = None
         self._use_accl_ep = wrapper.use_accl_ep
+        self._tracker = DeepEPLatencyTracker("DeepEP-LowLatency")
+
+    @property
+    def tracker(self):
+        return self._tracker if self._tracker.enabled else None
 
     @property
     def handle(self) -> Optional[Tuple[Any, ...]]:
@@ -147,9 +155,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         )
 
         # Dispatch tokens
+        self._tracker.mark_dispatch_start(dispatch_args["x"].size(0))
         expert_x, expert_num_tokens, self._handle, _, _ = (
             self._buffer.low_latency_dispatch(**dispatch_args)
         )
+        self._tracker.mark_dispatch_end()
         if self._use_fp8_dispatch:
             assert isinstance(expert_x, tuple), "expert_x should be a tuple"
             expert_x, expert_x_scale = expert_x[0], expert_x[1]
@@ -241,7 +251,9 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             combine_args (dict[str, Any]): Arguments for combining expert outputs.
         """
         # Normal finalize
+        self._tracker.mark_combine_start()
         combined_x, _, _ = self._buffer.low_latency_combine(**combine_args)
+        self._tracker.mark_combine_end()
 
         return combined_x
 

@@ -29,6 +29,9 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
 )
+from rtp_llm.models_py.modules.factory.fused_moe.utils.latency_tracker import (
+    DeepEPLatencyTracker,
+)
 from rtp_llm.models_py.utils.arch import get_sm
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
 
@@ -76,6 +79,16 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
         self.async_mode = False
         self.expert_alignment = expert_alignment
         self.handle: Any = None
+        self._tracker = DeepEPLatencyTracker("DeepEP-Normal")
+
+    @property
+    def tracker(self):
+        return self._tracker if self._tracker.enabled else None
+
+    def _gpu_event(self) -> torch.cuda.Event:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
 
     def prepare(
         self,
@@ -85,9 +98,13 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> ExpertForwardPayload:
+        _prof = self._tracker.enabled
         if a1_scale is not None or a2_scale is not None:
             raise ValueError("DeepEPNormal a1_scale or a2_scale should be None")
         act_dtype = a1.dtype
+
+        if _prof:
+            _e0 = self._gpu_event()
 
         # scatter
         tp_size = self.config.tp_size
@@ -117,6 +134,9 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
             tp_expert_a1 = torch.narrow(a1, 0, slice_begin, slice_size)
             tp_expert_input = tp_expert_a1
 
+        if _prof:
+            _e1 = self._gpu_event()
+
         # pre dispatch
         tp_expert_ids = torch.narrow(topk_ids, 0, slice_begin, slice_size).to(
             torch.int64
@@ -133,7 +153,11 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
             tp_expert_ids, self.expert_num
         )
 
+        if _prof:
+            _e2 = self._gpu_event()
+
         # dispatch
+        self._tracker.mark_dispatch_start(tp_expert_a1.size(0) if use_fp8 else tp_expert_a1.size(0))
         (
             output,
             recv_topk_idx,
@@ -152,6 +176,10 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
             tp_expert_scales,
             expert_alignment=self.expert_alignment,
         )
+        self._tracker.mark_dispatch_end()
+
+        if _prof:
+            _e3 = self._gpu_event()
 
         expert_x_scale: Optional[torch.Tensor] = None
         expert_x: torch.Tensor
@@ -178,6 +206,34 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
         else:
             expert_topk_ids = recv_topk_idx
 
+        if _prof:
+            _e4 = self._gpu_event()
+            torch.cuda.synchronize()
+            if not hasattr(self, '_prof_step'):
+                self._prof_step = 0
+                self._prof_tp_quant = 0.0
+                self._prof_layout = 0.0
+                self._prof_dispatch_gpu = 0.0
+                self._prof_post_dispatch = 0.0
+            self._prof_tp_quant += _e0.elapsed_time(_e1) * 1000
+            self._prof_layout += _e1.elapsed_time(_e2) * 1000
+            self._prof_dispatch_gpu += _e2.elapsed_time(_e3) * 1000
+            self._prof_post_dispatch += _e3.elapsed_time(_e4) * 1000
+            self._prof_step += 1
+            if self._prof_step % self._tracker._log_interval == 0:
+                import torch.distributed as _dist
+                _r = _dist.get_rank() if _dist.is_initialized() else 0
+                _n = self._prof_step
+                print(
+                    f"[Normal-GPU-Detail rank={_r}] steps={_n} | "
+                    f"tp+quant={self._prof_tp_quant/_n:.0f}us | "
+                    f"layout={self._prof_layout/_n:.0f}us | "
+                    f"dispatch_gpu={self._prof_dispatch_gpu/_n:.0f}us | "
+                    f"post_dispatch={self._prof_post_dispatch/_n:.0f}us | "
+                    f"sum={int((self._prof_tp_quant+self._prof_layout+self._prof_dispatch_gpu+self._prof_post_dispatch)/_n)}us",
+                    flush=True,
+                )
+
         return ExpertForwardPayload(
             expert_x=expert_x,
             expert_x_scale=expert_x_scale,
@@ -200,9 +256,11 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
     ) -> torch.Tensor:
         assert self.handle is not None, "handler is None"
         assert payload.fused_expert_output is not None, "fused_expert_output is None"
+        self._tracker.mark_combine_start()
         out_token, _, _ = self.deepep_buffer_wrapper.buffer.combine(
             payload.fused_expert_output, self.handle
         )
+        self._tracker.mark_combine_end()
         self.handle = None
 
         # gather
