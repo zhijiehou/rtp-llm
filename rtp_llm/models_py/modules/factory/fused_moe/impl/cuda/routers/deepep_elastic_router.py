@@ -274,6 +274,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 num_sms=self._elastic_num_sms,
                 do_expand=self._do_expand,
                 do_cpu_sync=self._do_cpu_sync,
+                do_handle_copy=False,
                 async_with_compute_stream=True,
             )
         )
