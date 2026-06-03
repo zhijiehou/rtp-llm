@@ -40,6 +40,7 @@ class ExpertForwardPayload:
     expert_topk_ids: Optional[torch.Tensor] = None
     expert_topk_weights: Optional[torch.Tensor] = None
     expert_ids_are_local: bool = False
+    dispatch_event: Optional[Any] = None
 
 
 @dataclass

@@ -165,6 +165,11 @@ class DeepGemmContiguousExecutor(FusedMoeExpertExecutor):
             torch.tensor(num_recv_tokens_per_expert, device=hidden_states_fp8_device, dtype=torch.int64),
         )
 
+        # 等待 dispatch 通信完成（m_indices 构建与 dispatch 通信尾部重叠）
+        dispatch_event = payload.dispatch_event
+        if dispatch_event is not None:
+            dispatch_event.current_stream_wait()
+
         # GEMM1: gate + up projection
         gateup_output = torch.empty(
             (all_tokens, N),

@@ -278,8 +278,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 async_with_compute_stream=True,
             )
         )
-        if event is not None and getattr(event, "event", None) is not None:
-            event.current_stream_wait()
+        dispatch_event = event if (event is not None and getattr(event, "event", None) is not None) else None
         self._handle = handle
 
         if isinstance(recv_x, tuple):
@@ -319,6 +318,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 expert_tokens_meta=ExpertTokensMetadata(
                     expert_num_tokens=expert_num_tokens_dc,
                 ),
+                dispatch_event=dispatch_event,
             )
 
         num_per_expert = handle.num_recv_tokens_per_expert_list
@@ -381,6 +381,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             expert_topk_ids=expert_topk_ids,
             expert_topk_weights=recv_topk_weights,
             expert_tokens_meta=meta,
+            dispatch_event=dispatch_event,
         )
 
     def finalize(
