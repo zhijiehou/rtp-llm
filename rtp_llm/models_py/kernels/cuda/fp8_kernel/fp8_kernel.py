@@ -133,7 +133,7 @@ def sgl_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
     if x.shape[0] > 0:
-        if masked_m is not None:
+        if masked_m is not None or fuse_silu_and_mul:
             per_token_group_quant_fp8_v2(
                 x,
                 x_q,
