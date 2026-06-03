@@ -406,7 +406,7 @@ def m_grouped_fp8_gemm_nt_contiguous(
     a: Tuple[torch.Tensor, torch.Tensor],
     b: Tuple[torch.Tensor, torch.Tensor],
     output: torch.Tensor,
-    m_indices: torch.Tensor,
+    grouped_layout: torch.Tensor,
     compiled_dims: str = "nk",
     disable_ue8m0_cast: Optional[bool] = None,
 ) -> None:
@@ -416,8 +416,8 @@ def m_grouped_fp8_gemm_nt_contiguous(
         a (Tuple[torch.Tensor, torch.Tensor]): FP8 data and scales for the first matrix with contiguous layout.
         b (Tuple[torch.Tensor, torch.Tensor]): FP8 data and scales for the second matrix.
         output (torch.Tensor): Output tensor.
-        m_indices (torch.Tensor): Grouped indices for valid tokens in each group.
-            The length of m_indices is the a[0].shape[0], and the corresponding value of valid tokens is group_idx.
+        grouped_layout (torch.Tensor): Per-row expert indices, shape [M], each element is the expert
+            index for that row, -1 for padding rows. (m_indices mode)
         compiled_dims (str, optional): Compiled dimensions. Defaults to "nk".
         disable_ue8m0_cast (bool, optional): Whether to disable E8M0 type cast for E8M0 scale.
             Defaults to None, which will be set to False if E8M0 scale is used, otherwise True.
@@ -430,7 +430,7 @@ def m_grouped_fp8_gemm_nt_contiguous(
         a,
         b,
         output,
-        m_indices,
+        grouped_layout,
         compiled_dims=compiled_dims,
         disable_ue8m0_cast=(
             disable_ue8m0_cast

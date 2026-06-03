@@ -105,7 +105,7 @@ class DeepepWrapperConfig:
     use_elastic: bool = False
     elastic_allow_hybrid_mode: bool = True
     elastic_prefer_overlap_with_compute: bool = True
-    elastic_allow_multiple_reduction: bool = False
+    elastic_allow_multiple_reduction: bool = True
     elastic_do_expand: bool = True
     elastic_do_cpu_sync: bool = True
     use_fp8: bool = False
@@ -176,7 +176,7 @@ class DeepepWrapperConfig:
                 int(os.environ.get("DEEPEP_ELASTIC_PREFER_OVERLAP", "1"))
             ),
             elastic_allow_multiple_reduction=bool(
-                int(os.environ.get("DEEPEP_ELASTIC_ALLOW_MULTIPLE_REDUCTION", "0"))
+                int(os.environ.get("DEEPEP_ELASTIC_ALLOW_MULTIPLE_REDUCTION", "1"))
             ),
             elastic_do_expand=bool(
                 int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1"))

@@ -231,7 +231,9 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
     Selected when ``USE_DEEPEP_ELASTIC=1`` with the default
     ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` —
     pairs the elastic router (tight ``[ΣN_e, hidden]`` layout) with
-    ``DeepGemmHybridExecutor``.
+    ``DeepGemmContiguousExecutor``, which uses DeepGEMM's psum layout
+    to directly consume the prefix-sum tensor from the elastic handle,
+    eliminating the ``repeat_interleave`` m_indices construction.
     """
 
     @classmethod
@@ -241,6 +243,7 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
         checker.check(quant_method == "FP8_PER_BLOCK")
         do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
         do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
+        checker.check(do_expand)
         checker.check(do_cpu_sync)
         checker.check(
             config.moe_strategy == "fp8_per_block_ep_elastic_contiguous"
@@ -248,8 +251,8 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
         )
 
     def get_attributes(self) -> StrategyAttributes:
-        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_hybrid_executor import (
-            DeepGemmHybridExecutor,
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_contiguous_executor import (
+            DeepGemmContiguousExecutor,
         )
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_elastic_router import (
             DeepEpElasticRouter,
@@ -261,7 +264,7 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
         )
         return StrategyAttributes(
             router_class=DeepEpElasticRouter,
-            executor_class=DeepGemmHybridExecutor,
+            executor_class=DeepGemmContiguousExecutor,
             quant_config=quant_config,
         )
 
