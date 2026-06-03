@@ -6,6 +6,8 @@ import math
 from typing import Any, Dict, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,44 @@ from rtp_llm.models_py.utils.arch import get_sm
 from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
 from rtp_llm.utils.model_weight import W
+
+
+@triton.jit
+def _build_m_indices_kernel(
+    tokens_per_expert_ptr,
+    m_indices_ptr,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_EXPERT_NUM: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_EXPERT_NUM)
+    tokens = tl.load(tokens_per_expert_ptr + offset, mask=offset < num_experts, other=0)
+    cumsum = tl.cumsum(tokens) - tokens
+    start = tl.sum(tl.where(offset < cur_expert, tokens, 0))
+    count = tl.load(tokens_per_expert_ptr + cur_expert)
+    base = m_indices_ptr + start
+    off = tl.arange(0, BLOCK_E)
+    for s in tl.range(0, count, BLOCK_E, num_stages=4):
+        tl.store(base + s + off, cur_expert)
+
+
+def build_m_indices_triton(
+    num_recv_tokens_per_expert: torch.Tensor,
+    all_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    m_indices = torch.empty(all_tokens, device=device, dtype=torch.int32)
+    if all_tokens > 0:
+        _build_m_indices_kernel[(num_experts,)](
+            num_recv_tokens_per_expert,
+            m_indices,
+            num_experts=num_experts,
+            BLOCK_E=128,
+            BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        )
+    return m_indices
 
 
 def align_up_math(n: int, alignment: int = 128) -> int:
@@ -143,7 +183,6 @@ class DeepGemmContiguousExecutor(FusedMoeExpertExecutor):
             align_up_math(x, self.EXPERT_ALIGNMENT) for x in num_recv_tokens_per_expert
         ]
         all_tokens: int = sum(num_recv_tokens_per_expert)
-        num_experts_local = len(num_recv_tokens_per_expert)
 
         if all_tokens <= 0:
             return CombineForwardPayload(
@@ -160,10 +199,10 @@ class DeepGemmContiguousExecutor(FusedMoeExpertExecutor):
 
         # 数据已由 DeepEP dispatch (do_expand=true) 按专家连续排列，
         # 无需 ep_scatter，只需生成 m_indices 告诉 grouped GEMM 每行属于哪个专家
-        m_indices = torch.repeat_interleave(
-            torch.arange(num_experts_local, device=hidden_states_fp8_device, dtype=torch.int32),
-            torch.tensor(num_recv_tokens_per_expert, device=hidden_states_fp8_device, dtype=torch.int64),
+        tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert, device=hidden_states_fp8_device, dtype=torch.int32,
         )
+        m_indices = build_m_indices_triton(tokens_per_expert_gpu, all_tokens, hidden_states_fp8_device)
 
         # 等待 dispatch 通信完成（m_indices 构建与 dispatch 通信尾部重叠）
         dispatch_event = payload.dispatch_event
@@ -188,35 +227,24 @@ class DeepGemmContiguousExecutor(FusedMoeExpertExecutor):
         )
         dispose_tensor(hidden_states_fp8)
 
-        # SiLU activation
-        down_input = torch.empty(
-            (all_tokens, N // 2),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
-        )
+        # Fused SiLU + FP8 quantize: single-pass over gateup_output
         gateup_output = gateup_output.view(-1, N)
-        silu_and_mul(down_input, gateup_output)
+        down_input_fp8, down_input_scale = sgl_per_token_group_quant_fp8(
+            gateup_output,
+            group_size=self.BLOCK_SIZE,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=is_deep_gemm_e8m0_used(),
+            fuse_silu_and_mul=True,
+        )
         del gateup_output
-
-        # FP8 quantize for GEMM2
+        if not is_deep_gemm_e8m0_used():
+            down_input_scale = tma_align_input_scale(down_input_scale)
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
-        if is_deep_gemm_e8m0_used():
-            down_input_fp8, down_input_scale = sgl_per_token_group_quant_fp8(
-                down_input,
-                group_size=self.BLOCK_SIZE,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=is_deep_gemm_e8m0_used(),
-            )
-        else:
-            down_input_fp8, down_input_scale = trt_fp8_quantize_128(down_input, False)
-        del down_input
-        if not is_deep_gemm_e8m0_used():
-            down_input_scale = tma_align_input_scale(down_input_scale)
 
         # GEMM2: down projection
         m_grouped_fp8_gemm_nt_contiguous(
