@@ -1,8 +1,14 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, final
+import logging
+import os
+import time
 
 import torch
+
+_logger = logging.getLogger(__name__)
+_PROFILE_MOE = os.environ.get("PROFILE_FUSED_MOE", "0") == "1"
 
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -190,6 +196,10 @@ class FusedMoe(torch.nn.Module):
 
         a1 = hidden_states
 
+        if _PROFILE_MOE:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         expert_payload = self.router.prepare(
             a1,
             a1_scale,
@@ -198,18 +208,16 @@ class FusedMoe(torch.nn.Module):
             topk_ids,
         )
 
+        if _PROFILE_MOE:
+            torch.cuda.synchronize()
+            _t_prepare = time.perf_counter()
+
         if expert_payload.expert_topk_ids is None:
             expert_payload.expert_topk_ids = topk_ids
         if expert_payload.expert_topk_weights is None:
             expert_payload.expert_topk_weights = topk_weights
 
         if expert_payload.expert_x.numel() == 0:
-            # This happens when none of the tokens from the all2all reach this
-            # EP rank. Also, note that this is only relevant for CUDAGraph
-            # incompatible all2all kernels like the DeepEP high-throughput
-            # kernels. CUDAGraph compatible all2all kernels like the pplx
-            # kernels and the DeepEP low-latency kernels are always batched
-            # and can never run into the tensor.numel() == 0 case.
             combine_payload = CombineForwardPayload(
                 fused_expert_output=torch.empty_like(
                     expert_payload.expert_x, dtype=a1.dtype
@@ -224,6 +232,10 @@ class FusedMoe(torch.nn.Module):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 extra_expert_args=extra_expert_args,
             )
+
+        if _PROFILE_MOE:
+            torch.cuda.synchronize()
+            _t_execute = time.perf_counter()
 
         # pass a1.shape to finalize for shape check
         if extra_finalize_args is None:
@@ -240,6 +252,23 @@ class FusedMoe(torch.nn.Module):
             apply_router_weight_on_input,
             extra_finalize_args,
         )
+
+        if _PROFILE_MOE:
+            torch.cuda.synchronize()
+            _t_finalize = time.perf_counter()
+            router_name = type(self.router).__name__
+            tokens = a1.size(0)
+            prepare_ms = (_t_prepare - _t0) * 1000
+            execute_ms = (_t_execute - _t_prepare) * 1000
+            finalize_ms = (_t_finalize - _t_execute) * 1000
+            total_ms = (_t_finalize - _t0) * 1000
+            _logger.warning(
+                f"[PROFILE FusedMoe] router={router_name} tokens={tokens} | "
+                f"prepare={prepare_ms:.3f}ms ({prepare_ms/total_ms*100:.1f}%) | "
+                f"execute={execute_ms:.3f}ms ({execute_ms/total_ms*100:.1f}%) | "
+                f"finalize={finalize_ms:.3f}ms ({finalize_ms/total_ms*100:.1f}%) | "
+                f"total={total_ms:.3f}ms"
+            )
 
         assert (
             output.shape == hidden_states.shape
