@@ -1,3 +1,6 @@
+import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, final
@@ -157,6 +160,82 @@ class FusedMoeExpertExecutor(ABC):
 
 
 @final
+class _MoeProfiler:
+    """MoE layer profiler using CUDA events for GPU timing, gated by PROFILE_FUSED_MOE=1.
+
+    Measures actual GPU execution time for prepare/execute/finalize via CUDA events,
+    plus wall-clock span from first to last MoE layer (with single GPU sync at end).
+    """
+
+    enabled: bool = False
+    _initialized: bool = False
+    _layer: int = 0
+    _req: int = 0
+    _prep_events: list = []
+    _exec_events: list = []
+    _fin_events: list = []
+    _span_start: float = 0
+    _num_layers: int = 61
+    _logger = None
+
+    @classmethod
+    def init(cls) -> None:
+        if cls._initialized:
+            return
+        cls.enabled = os.environ.get("PROFILE_FUSED_MOE", "0") == "1"
+        cls._num_layers = int(os.environ.get("PROFILE_NUM_LAYERS", "61"))
+        if cls.enabled:
+            cls._logger = logging.getLogger("moe_profiler")
+        cls._initialized = True
+
+    @classmethod
+    def on_forward_start(cls) -> torch.cuda.Event:
+        if cls._layer == 0:
+            cls._span_start = time.perf_counter()
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        return ev
+
+    @classmethod
+    def on_phase_boundary(cls) -> torch.cuda.Event:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        return ev
+
+    @classmethod
+    def on_forward_end(
+        cls, ev_start: torch.cuda.Event, ev_prep: torch.cuda.Event, ev_exec: torch.cuda.Event
+    ) -> None:
+        ev_end = torch.cuda.Event(enable_timing=True)
+        ev_end.record()
+        cls._prep_events.append((ev_start, ev_prep))
+        cls._exec_events.append((ev_prep, ev_exec))
+        cls._fin_events.append((ev_exec, ev_end))
+        cls._layer += 1
+
+        if cls._layer >= cls._num_layers:
+            torch.cuda.synchronize()
+            span = (time.perf_counter() - cls._span_start) * 1000
+            cls._req += 1
+            n = cls._num_layers
+            ps = sum(s.elapsed_time(e) for s, e in cls._prep_events[-n:])
+            es = sum(s.elapsed_time(e) for s, e in cls._exec_events[-n:])
+            fs = sum(s.elapsed_time(e) for s, e in cls._fin_events[-n:])
+            gpu_total = ps + es + fs
+            cls._logger.warning(  # type: ignore[union-attr]
+                f"[MOE-PROFILE req#{cls._req}] "
+                f"span={span:.1f}ms gpu_total={gpu_total:.1f}ms | "
+                f"prepare={ps:.1f}ms({ps/gpu_total*100:.0f}%) "
+                f"execute={es:.1f}ms({es/gpu_total*100:.0f}%) "
+                f"finalize={fs:.1f}ms({fs/gpu_total*100:.0f}%) | "
+                f"per_layer: prep={ps/n:.3f} exec={es/n:.3f} fin={fs/n:.3f}ms"
+            )
+            cls._layer = 0
+            cls._prep_events.clear()
+            cls._exec_events.clear()
+            cls._fin_events.clear()
+
+
 class FusedMoe(torch.nn.Module):
     def __init__(
         self,
@@ -187,9 +266,13 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]] = None,
         extra_finalize_args: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
+        _MoeProfiler.init()
+        _profiling = _MoeProfiler.enabled and hidden_states.size(0) > 10
 
         a1 = hidden_states
 
+        if _profiling:
+            _ev0 = _MoeProfiler.on_forward_start()
         expert_payload = self.router.prepare(
             a1,
             a1_scale,
@@ -203,13 +286,9 @@ class FusedMoe(torch.nn.Module):
         if expert_payload.expert_topk_weights is None:
             expert_payload.expert_topk_weights = topk_weights
 
+        if _profiling:
+            _ev1 = _MoeProfiler.on_phase_boundary()
         if expert_payload.expert_x.numel() == 0:
-            # This happens when none of the tokens from the all2all reach this
-            # EP rank. Also, note that this is only relevant for CUDAGraph
-            # incompatible all2all kernels like the DeepEP high-throughput
-            # kernels. CUDAGraph compatible all2all kernels like the pplx
-            # kernels and the DeepEP low-latency kernels are always batched
-            # and can never run into the tensor.numel() == 0 case.
             combine_payload = CombineForwardPayload(
                 fused_expert_output=torch.empty_like(
                     expert_payload.expert_x, dtype=a1.dtype
@@ -225,6 +304,8 @@ class FusedMoe(torch.nn.Module):
                 extra_expert_args=extra_expert_args,
             )
 
+        if _profiling:
+            _ev2 = _MoeProfiler.on_phase_boundary()
         # pass a1.shape to finalize for shape check
         if extra_finalize_args is None:
             extra_finalize_args = {"a1_shape": a1.shape}
@@ -240,6 +321,9 @@ class FusedMoe(torch.nn.Module):
             apply_router_weight_on_input,
             extra_finalize_args,
         )
+
+        if _profiling:
+            _MoeProfiler.on_forward_end(_ev0, _ev1, _ev2)
 
         assert (
             output.shape == hidden_states.shape
