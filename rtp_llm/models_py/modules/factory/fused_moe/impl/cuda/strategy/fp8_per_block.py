@@ -241,7 +241,7 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
         checker.check(quant_method == "FP8_PER_BLOCK")
         do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
         do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
-        checker.check(do_expand and do_cpu_sync)
+        checker.check(do_cpu_sync)
         checker.check(
             config.moe_strategy == "fp8_per_block_ep_elastic_contiguous"
             or config.moe_strategy == "auto"

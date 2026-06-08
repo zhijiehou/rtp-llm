@@ -97,16 +97,10 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         self._do_expand: bool = deepep_config.elastic_do_expand
         self._do_cpu_sync: bool = deepep_config.elastic_do_cpu_sync
-        assert (self._do_expand and self._do_cpu_sync) or (
-            (not self._do_expand) and (not self._do_cpu_sync)
-        ), (
-            "DeepEpElasticRouter supports two layouts: prefill "
-            "(DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1) and "
-            "decode cudagraph (DEEPEP_ELASTIC_DO_EXPAND=0, "
-            "DEEPEP_ELASTIC_DO_CPU_SYNC=0). Got do_expand="
-            f"{self._do_expand}, do_cpu_sync={self._do_cpu_sync}."
-        )
-        self._use_decode_cudagraph: bool = not self._do_cpu_sync
+        # Allow (do_expand=False, do_cpu_sync=True) for prefill without GPU-CPU sync
+        self._use_decode_cudagraph: bool = (
+            not self._do_cpu_sync
+        ) and (not self._do_expand)
 
         wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert wrapper.mode == DeepEPMode.ELASTIC, (
