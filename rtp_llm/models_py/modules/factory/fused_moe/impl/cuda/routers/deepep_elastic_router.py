@@ -42,7 +42,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
     """DeepEPv2 ElasticBuffer dispatch/combine router.
 
     Two layouts:
-      (do_expand=True,  do_cpu_sync=True)  → 2D Contiguous prefill (default)
+      (do_expand=False, do_cpu_sync=True)  → prefill (compact, no expand)
       (do_expand=False, do_cpu_sync=False) → decode cudagraph
     """
 
@@ -88,9 +88,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         self._use_fp4: bool = (
             MoeConfigResolver().get_quant_method(config) == "modelopt_fp4"
         )
-        self._use_local_expert_ids: bool = (
-            self._use_fp8_dispatch or self._use_fp4
-        )
+        self._use_local_expert_ids: bool = self._use_fp8_dispatch or self._use_fp4
         self._expert_alignment: int = 128 if quant_config.is_block_quantized else 1
 
         deepep_config = DeepepWrapperConfig.from_config_adapter(self.config)
@@ -98,9 +96,9 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         self._do_expand: bool = deepep_config.elastic_do_expand
         self._do_cpu_sync: bool = deepep_config.elastic_do_cpu_sync
         # Allow (do_expand=False, do_cpu_sync=True) for prefill without GPU-CPU sync
-        self._use_decode_cudagraph: bool = (
-            not self._do_cpu_sync
-        ) and (not self._do_expand)
+        self._use_decode_cudagraph: bool = (not self._do_cpu_sync) and (
+            not self._do_expand
+        )
 
         wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert wrapper.mode == DeepEPMode.ELASTIC, (
@@ -110,7 +108,9 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
         )
         self._buffer = wrapper.elastic_buffer
         self._handle: Optional[Any] = None
-        self._nan_guard_active: bool = bool(int(os.environ.get("DEEPEP_ELASTIC_NAN_GUARD", "1")))
+        self._nan_guard_active: bool = bool(
+            int(os.environ.get("DEEPEP_ELASTIC_NAN_GUARD", "1"))
+        )
         self._elastic_num_sms: int = int(os.environ.get("DEEPEP_ELASTIC_NUM_SMS", "0"))
 
     @property
@@ -136,14 +136,10 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             torch.narrow(topk_weights, 0, slice_begin, slice_size),
         )
 
-    def _do_quant_fp8(
-        self, a1: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _do_quant_fp8(self, a1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if a1.size(0) == 0:
             hidden = a1.size(1)
-            a1_q = torch.empty(
-                (0, hidden), dtype=torch.float8_e4m3fn, device=a1.device
-            )
+            a1_q = torch.empty((0, hidden), dtype=torch.float8_e4m3fn, device=a1.device)
             scale_cols = hidden // 128 if hidden >= 128 else 1
             a1_scale = torch.empty(
                 (0, scale_cols), dtype=torch.float32, device=a1.device
@@ -244,133 +240,70 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         act_dtype = a1.dtype
 
+        # nan数值校验和重复topk替换
         if self._nan_guard_active:
             a1, topk_ids, topk_weights = self._nan_guard(a1, topk_ids, topk_weights)
 
-        tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(
-            a1, topk_ids, topk_weights
-        )
+        # tp切分
+        tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(a1, topk_ids, topk_weights)
 
+        # fp8量化
         if self._use_fp8_dispatch:
-            assert (
-                self.quant_config.is_block_quantized
-                or self.quant_config.is_per_act_token
-            ), (
-                "ElasticRouter FP8 dispatch requires block_quantized or "
-                f"per_act_token quant config, got {self.quant_config}"
-            )
             x_payload = self._do_quant_fp8(tp_a1)
         else:
             x_payload = tp_a1
 
-        recv_x, recv_topk_idx, recv_topk_weights, handle, event = (
-            self._buffer.dispatch(
-                x=x_payload,
-                topk_idx=tp_topk_ids,
-                topk_weights=tp_topk_weights,
-                num_experts=self._num_experts,
-                expert_alignment=self._expert_alignment,
-                num_sms=self._elastic_num_sms,
-                do_expand=self._do_expand,
-                do_cpu_sync=self._do_cpu_sync,
-                async_with_compute_stream=True,
-            )
+        # 启动dispatch的kernel
+        recv_x, recv_topk_idx, recv_topk_weights, self._handle, _ = self._buffer.dispatch(
+            x=x_payload,
+            topk_idx=tp_topk_ids,
+            topk_weights=tp_topk_weights,
+            num_experts=self._num_experts,
+            expert_alignment=self._expert_alignment,
+            num_sms=self._elastic_num_sms,
+            do_expand=self._do_expand,
+            do_cpu_sync=self._do_cpu_sync,
+            async_with_compute_stream=False,
         )
-        if event is not None and getattr(event, "event", None) is not None:
-            event.current_stream_wait()
-        self._handle = handle
 
         if isinstance(recv_x, tuple):
             expert_x, expert_x_scale = recv_x
-            if (
-                expert_x_scale is not None
-                and self.quant_config.is_per_act_token
-                and expert_x_scale.dim() == 2
-                and expert_x_scale.size(1) > 1
-            ):
-                expert_x_scale = expert_x_scale[:, 0].contiguous()
         else:
             expert_x, expert_x_scale = recv_x, None
 
-        if self._use_decode_cudagraph:
-            assert recv_topk_idx is not None, (
-                "(False, False) dispatch must return per-row recv_topk_idx."
-            )
-            if self._use_local_expert_ids:
-                expert_topk_ids = recv_topk_idx
-            else:
-                expert_topk_ids = torch.where(
-                    recv_topk_idx == -1,
-                    self._num_experts - 1 if self._rank_expert_offset == 0 else 0,
-                    recv_topk_idx + self._rank_expert_offset,
+        # do_cpu_sync决定是否存在num_recv_tokens_per_expert_list，然后不同的方式生成expert_tokens_meta
+        if self._do_cpu_sync:
+            expert_num_tokens_cpu = self._handle.num_recv_tokens_per_expert_list
+            if len(expert_num_tokens_cpu) == 0:
+                expert_num_tokens_cpu = [0] * self._expert_per_rank
+            elif len(expert_num_tokens_cpu) != self._expert_per_rank:
+                raise AssertionError(
+                    f"ElasticBuffer handle.num_recv_tokens_per_expert_list len "
+                    f"{len(expert_num_tokens_cpu)} differs from E_local "
+                    f"{self._expert_per_rank}; ep_size={self._ep_size}"
                 )
-            psum = handle.psum_num_recv_tokens_per_expert
-            expert_num_tokens_dc = torch.diff(
+            expert_num_tokens_gpu = torch.tensor(
+                expert_num_tokens_cpu, device=expert_x.device, dtype=torch.int32
+            )
+        else:
+            psum = self._handle.psum_num_recv_tokens_per_expert
+            expert_num_tokens_gpu = torch.diff(
                 psum, prepend=torch.zeros(1, device=psum.device, dtype=psum.dtype)
             ).to(torch.int32)
-            return ExpertForwardPayload(
-                expert_x=expert_x,
-                expert_x_scale=expert_x_scale,
-                expert_x_origin_dtype=act_dtype,
-                expert_topk_ids=expert_topk_ids,
-                expert_topk_weights=recv_topk_weights,
-                expert_tokens_meta=ExpertTokensMetadata(
-                    expert_num_tokens=expert_num_tokens_dc,
-                ),
-            )
+            expert_num_tokens_cpu = None
 
-        num_per_expert = handle.num_recv_tokens_per_expert_list
-        if len(num_per_expert) == 0:
-            num_per_expert = [0] * self._expert_per_rank
-        elif len(num_per_expert) != self._expert_per_rank:
-            raise AssertionError(
-                f"ElasticBuffer handle.num_recv_tokens_per_expert_list len "
-                f"{len(num_per_expert)} differs from E_local "
-                f"{self._expert_per_rank}; ep_size={self._ep_size}"
-            )
-        expert_num_tokens = torch.tensor(
-            num_per_expert,
-            device=expert_x.device,
-            dtype=torch.int32,
-        )
-
-        # 2D Contiguous: each received row is a single (token, expert) pair.
-        # Synthesize per-row expert_topk_ids from per-expert counts.
-        if recv_topk_idx is None:
-            eid_offset = 0 if self._use_local_expert_ids else self._rank_expert_offset
-            ids = torch.arange(
-                eid_offset,
-                eid_offset + len(num_per_expert),
-                device=expert_x.device,
-                dtype=torch.int64,
-            )
-            counts = expert_num_tokens.to(torch.int64)
-            total = counts.sum()
-            if total > 0:
-                expert_topk_ids = torch.repeat_interleave(
-                    ids, counts
-                ).unsqueeze(1)
-            else:
-                expert_topk_ids = torch.empty(
-                    (0, 1), device=expert_x.device, dtype=torch.int64
-                )
+        # 根据不同要求，填充本地专家ID或者全局专家ID
+        if self._use_local_expert_ids:
+            expert_topk_ids = recv_topk_idx
         else:
-            if self._use_local_expert_ids:
-                expert_topk_ids = recv_topk_idx
-            else:
-                expert_topk_ids = torch.where(
-                    recv_topk_idx == -1,
-                    self._num_experts - 1 if self._rank_expert_offset == 0 else 0,
-                    recv_topk_idx + self._rank_expert_offset,
-                )
+            expert_topk_ids = torch.where(
+                recv_topk_idx == -1,
+                recv_topk_idx,
+                recv_topk_idx + self._rank_expert_offset,
+            )
 
         if recv_topk_weights is not None and recv_topk_weights.dim() == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
-
-        meta = ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens,
-            expert_num_tokens_cpu=num_per_expert,
-        )
 
         return ExpertForwardPayload(
             expert_x=expert_x,
@@ -378,7 +311,10 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             expert_x_origin_dtype=act_dtype,
             expert_topk_ids=expert_topk_ids,
             expert_topk_weights=recv_topk_weights,
-            expert_tokens_meta=meta,
+            expert_tokens_meta=ExpertTokensMetadata(
+                expert_num_tokens=expert_num_tokens_gpu,
+                expert_num_tokens_cpu=expert_num_tokens_cpu,
+            ),
         )
 
     def finalize(
@@ -399,18 +335,13 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             x.dtype == torch.bfloat16
         ), f"ElasticBuffer.combine requires bfloat16 input, got {x.dtype}"
 
-        combined_x, _, combine_event = self._buffer.combine(
+        combined_x, _, _ = self._buffer.combine(
             x=x,
             handle=self._handle,
             topk_weights=None,
             num_sms=self._elastic_num_sms,
-            async_with_compute_stream=True,
+            async_with_compute_stream=False,
         )
-        if (
-            combine_event is not None
-            and getattr(combine_event, "event", None) is not None
-        ):
-            combine_event.current_stream_wait()
         self._handle = None
 
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)
