@@ -329,6 +329,7 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 f"{len(num_per_expert)} differs from E_local "
                 f"{self._expert_per_rank}; ep_size={self._ep_size}"
             )
+        total = sum(num_per_expert)
         expert_num_tokens = torch.tensor(
             num_per_expert,
             device=expert_x.device,
@@ -345,11 +346,10 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 device=expert_x.device,
                 dtype=torch.int64,
             )
-            counts = expert_num_tokens.to(torch.int64)
-            total = counts.sum()
             if total > 0:
+                counts = expert_num_tokens.to(torch.int64)
                 expert_topk_ids = torch.repeat_interleave(
-                    ids, counts
+                    ids, counts, output_size=total
                 ).unsqueeze(1)
             else:
                 expert_topk_ids = torch.empty(
