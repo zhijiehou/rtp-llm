@@ -302,9 +302,6 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
                 recv_topk_idx + self._rank_expert_offset,
             )
 
-        if recv_topk_weights is not None and recv_topk_weights.dim() == 1:
-            recv_topk_weights = recv_topk_weights.unsqueeze(1)
-
         return ExpertForwardPayload(
             expert_x=expert_x,
             expert_x_scale=expert_x_scale,
