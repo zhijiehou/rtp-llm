@@ -193,6 +193,40 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
             combined_x = gathered[:original_num_tokens, :]
         return combined_x
 
+    def _nan_guard(
+        self,
+        a1: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        a1 = torch.where(torch.isnan(a1), torch.zeros_like(a1), a1)
+
+        inv_k = 1.0 / float(self._num_topk)
+        topk_weights = torch.where(
+            torch.isnan(topk_weights),
+            torch.full_like(topk_weights, inv_k),
+            topk_weights,
+        )
+
+        if topk_ids.size(1) > 1:
+            rows = topk_ids.size(0)
+            k_topk = topk_ids.size(1)
+            rr = (
+                torch.arange(
+                    rows * k_topk,
+                    device=topk_ids.device,
+                    dtype=topk_ids.dtype,
+                )
+                % self._num_experts
+            ).reshape(rows, k_topk)
+            sorted_ids, _ = torch.sort(topk_ids, dim=-1)
+            has_dup = (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any(
+                dim=-1, keepdim=True
+            )
+            topk_ids = torch.where(has_dup, rr, topk_ids)
+
+        return a1, topk_ids, topk_weights
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -210,37 +244,8 @@ class DeepEpElasticRouter(FusedMoeDataRouter):
 
         act_dtype = a1.dtype
 
-        # NaN guard: qwen35_moe produces NaN at layer 1 during init warmup,
-        # which triggers DeepEPv2 dispatch ptx::deduplicate assertion.
-        # GPU-only ops (torch.where), no .item()/.cpu(), cuda-graph safe.
         if self._nan_guard_active:
-            a1 = torch.where(torch.isnan(a1), torch.zeros_like(a1), a1)
-
-            inv_k = 1.0 / float(self._num_topk)
-            topk_weights = torch.where(
-                torch.isnan(topk_weights),
-                torch.full_like(topk_weights, inv_k),
-                topk_weights,
-            )
-
-            # Deduplicate topk_ids rows: ptx::deduplicate fails when any two
-            # slots in a row are equal. Replace such rows with round-robin ids.
-            if topk_ids.size(1) > 1:
-                rows = topk_ids.size(0)
-                k_topk = topk_ids.size(1)
-                rr = (
-                    torch.arange(
-                        rows * k_topk,
-                        device=topk_ids.device,
-                        dtype=topk_ids.dtype,
-                    )
-                    % self._num_experts
-                ).reshape(rows, k_topk)
-                sorted_ids, _ = torch.sort(topk_ids, dim=-1)
-                has_dup = (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any(
-                    dim=-1, keepdim=True
-                )
-                topk_ids = torch.where(has_dup, rr, topk_ids)
+            a1, topk_ids, topk_weights = self._nan_guard(a1, topk_ids, topk_weights)
 
         tp_a1, tp_topk_ids, tp_topk_weights = self._tp_slice(
             a1, topk_ids, topk_weights
