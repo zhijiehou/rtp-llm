@@ -228,12 +228,10 @@ class CudaFp8PerBlockEpNormalStrategy(MoeStrategy):
 class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
     """CUDA FP8 PerBlock EP elastic 2D Contiguous strategy.
 
-    Selected when ``USE_DEEPEP_ELASTIC=1`` with the default
-    ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` —
-    pairs the elastic router (tight ``[ΣN_e, hidden]`` layout) with
-    ``DeepGemmContiguousExecutor``, which uses DeepGEMM's psum layout
-    to directly consume the prefix-sum tensor from the elastic handle,
-    eliminating the ``repeat_interleave`` m_indices construction.
+    Selected when ``USE_DEEPEP_ELASTIC=1`` and ``DEEPEP_ELASTIC_USE_CONTIGUOUS=1``
+    with ``DEEPEP_ELASTIC_DO_EXPAND=1, DEEPEP_ELASTIC_DO_CPU_SYNC=1`` —
+    pairs the elastic router with ``DeepGemmContiguousExecutor``,
+    which skips ep_scatter/ep_gather by relying on do_expand=True layout.
     """
 
     @classmethod
@@ -241,6 +239,8 @@ class CudaFp8PerBlockEpElasticContiguousStrategy(MoeStrategy):
         resolver = MoeConfigResolver()
         quant_method = resolver.get_quant_method(config)
         checker.check(quant_method == "FP8_PER_BLOCK")
+        use_contiguous = bool(int(os.environ.get("DEEPEP_ELASTIC_USE_CONTIGUOUS", "0")))
+        checker.check(use_contiguous)
         do_expand = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_EXPAND", "1")))
         do_cpu_sync = bool(int(os.environ.get("DEEPEP_ELASTIC_DO_CPU_SYNC", "1")))
         checker.check(do_expand)
