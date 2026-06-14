@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, final
+import os
 
 import torch
 
@@ -158,6 +159,8 @@ class FusedMoeExpertExecutor(ABC):
 
 @final
 class FusedMoe(torch.nn.Module):
+    _instance_counter = 0
+
     def __init__(
         self,
         router: FusedMoeDataRouter,
@@ -168,12 +171,22 @@ class FusedMoe(torch.nn.Module):
         self.router = router
         self.fused_experts = fused_experts
         self.expert_num = expert_num
+        self._profile_step = 0
+        # Assign a unique layer index to distinguish multiple MoE layers
+        FusedMoe._instance_counter += 1
+        self._layer_id = FusedMoe._instance_counter
+        # warmup: skip first N inference requests before recording
+        self._profile_warmup = int(os.environ.get("PROFILE_FUSED_MOE_WARMUP", "3"))
+        # active: number of consecutive inference requests to record
+        self._profile_active = int(os.environ.get("PROFILE_FUSED_MOE_ACTIVE", "5"))
+        # torch.profiler instance, created lazily when recording starts
+        self._profiler = None
 
     @property
     def topk_ids_dtype(self) -> torch.dtype:
         return self.fused_experts.topk_ids_dtype
 
-    def forward(
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -246,3 +259,83 @@ class FusedMoe(torch.nn.Module):
         ), f"output batch size mismatch: expected {hidden_states.shape}, got {output.shape}"
 
         return output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        inplace: bool = False,
+        activation: str = "silu",
+        expert_map: Optional[torch.Tensor] = None,
+        a1_scale: Optional[torch.Tensor] = None,
+        a2_scale: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        extra_expert_args: Optional[Dict[str, Any]] = None,
+        extra_finalize_args: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        profile_enabled = os.environ.get("PROFILE_FUSED_MOE", "0") == "1"
+
+        if profile_enabled:
+            self._profile_step += 1
+            in_warmup = self._profile_step <= self._profile_warmup
+            in_active = (
+                self._profile_warmup < self._profile_step
+                <= self._profile_warmup + self._profile_active
+            )
+            just_finished = self._profile_step == self._profile_warmup + self._profile_active + 1
+
+            if in_active and self._profiler is None:
+                # First active step: create and start the profiler
+                from torch.profiler import ProfilerActivity, profile
+                self._profiler = profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                )
+                self._profiler.__enter__()
+
+            output = self._forward_impl(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=inplace,
+                activation=activation,
+                expert_map=expert_map,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                extra_expert_args=extra_expert_args,
+                extra_finalize_args=extra_finalize_args,
+            )
+
+            if in_active and self._profiler is not None:
+                self._profiler.step()
+
+            if just_finished and self._profiler is not None:
+                # Active window ended: stop profiler and export
+                torch.cuda.synchronize()
+                self._profiler.__exit__(None, None, None)
+                rank = 0
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    rank = torch.distributed.get_rank()
+                default_path = f"/root/hzj/fused_moe_layer{self._layer_id}_rank{rank}.json"
+                trace_path = os.environ.get("PROFILE_FUSED_MOE_OUTPUT", default_path)
+                self._profiler.export_chrome_trace(trace_path)
+                print(f"[FusedMoe profiler] layer={self._layer_id} rank={rank} "
+                      f"active={self._profile_active} steps, timeline saved to {trace_path}")
+                self._profiler = None
+
+            return output
+
+        return self._forward_impl(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            activation=activation,
+            expert_map=expert_map,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            extra_expert_args=extra_expert_args,
+            extra_finalize_args=extra_finalize_args,
+        )
