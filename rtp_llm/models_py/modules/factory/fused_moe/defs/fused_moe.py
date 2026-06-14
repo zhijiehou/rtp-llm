@@ -1,7 +1,7 @@
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, final
-import os
 
 import torch
 
@@ -202,7 +202,14 @@ class FusedMoe(torch.nn.Module):
     ) -> torch.Tensor:
 
         a1 = hidden_states
+        nvtx_enabled = os.environ.get("PROFILE_FUSED_MOE", "0") == "1"
+        layer_tag = f"MoE_L{self._layer_id}"
 
+        # ---- dispatch (router.prepare = EP all2all dispatch) ----
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_push(
+                f"{layer_tag}/dispatch_tokens={hidden_states.shape[0]}"
+            )
         expert_payload = self.router.prepare(
             a1,
             a1_scale,
@@ -210,12 +217,17 @@ class FusedMoe(torch.nn.Module):
             topk_weights,
             topk_ids,
         )
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
         if expert_payload.expert_topk_ids is None:
             expert_payload.expert_topk_ids = topk_ids
         if expert_payload.expert_topk_weights is None:
             expert_payload.expert_topk_weights = topk_weights
 
+        # ---- expert compute (GEMM) ----
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_push(f"{layer_tag}/gemm")
         if expert_payload.expert_x.numel() == 0:
             # This happens when none of the tokens from the all2all reach this
             # EP rank. Also, note that this is only relevant for CUDAGraph
@@ -237,6 +249,8 @@ class FusedMoe(torch.nn.Module):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 extra_expert_args=extra_expert_args,
             )
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
         # pass a1.shape to finalize for shape check
         if extra_finalize_args is None:
@@ -246,6 +260,9 @@ class FusedMoe(torch.nn.Module):
 
         extra_finalize_args.update({"original_num_tokens": hidden_states.size(0)})
 
+        # ---- combine (router.finalize = EP all2all combine) ----
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_push(f"{layer_tag}/combine")
         output = self.router.finalize(
             combine_payload,
             expert_payload.expert_topk_weights,
@@ -253,6 +270,8 @@ class FusedMoe(torch.nn.Module):
             apply_router_weight_on_input,
             extra_finalize_args,
         )
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
         assert (
             output.shape == hidden_states.shape
@@ -275,23 +294,45 @@ class FusedMoe(torch.nn.Module):
         extra_finalize_args: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         profile_enabled = os.environ.get("PROFILE_FUSED_MOE", "0") == "1"
+        # Only profile specific layers to avoid Kineto singleton conflict
+        # when multiple MoE layers run concurrently.
+        # PROFILE_NUM_LAYERS controls how many layers (starting from layer 1) to profile.
+        profile_num_layers = int(os.environ.get("PROFILE_NUM_LAYERS", "1"))
+        # Skip forwards with too few tokens (e.g. fake DP dispatch, warmup padding).
+        # PROFILE_MIN_TOKENS=0 disables the filter.
+        profile_min_tokens = int(os.environ.get("PROFILE_MIN_TOKENS", "16"))
+        num_tokens = hidden_states.shape[0]
+        token_count_ok = (profile_min_tokens == 0) or (num_tokens >= profile_min_tokens)
+        should_profile_this_layer = (
+            profile_enabled
+            and (self._layer_id <= profile_num_layers)
+            and token_count_ok
+        )
 
-        if profile_enabled:
+        if should_profile_this_layer:
             self._profile_step += 1
-            in_warmup = self._profile_step <= self._profile_warmup
             in_active = (
-                self._profile_warmup < self._profile_step
+                self._profile_warmup
+                < self._profile_step
                 <= self._profile_warmup + self._profile_active
             )
-            just_finished = self._profile_step == self._profile_warmup + self._profile_active + 1
+            just_finished = (
+                self._profile_step == self._profile_warmup + self._profile_active + 1
+            )
 
             if in_active and self._profiler is None:
-                # First active step: create and start the profiler
-                from torch.profiler import ProfilerActivity, profile
-                self._profiler = profile(
-                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
-                )
-                self._profiler.__enter__()
+                try:
+                    from torch.profiler import ProfilerActivity, profile
+
+                    self._profiler = profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                    )
+                    self._profiler.__enter__()
+                except Exception as profiler_ex:
+                    print(
+                        f"[FusedMoe profiler] layer={self._layer_id} failed to start: {profiler_ex}"
+                    )
+                    self._profiler = None
 
             output = self._forward_impl(
                 hidden_states=hidden_states,
@@ -308,21 +349,38 @@ class FusedMoe(torch.nn.Module):
             )
 
             if in_active and self._profiler is not None:
-                self._profiler.step()
+                try:
+                    self._profiler.step()
+                except Exception:
+                    pass
 
             if just_finished and self._profiler is not None:
-                # Active window ended: stop profiler and export
-                torch.cuda.synchronize()
-                self._profiler.__exit__(None, None, None)
-                rank = 0
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    rank = torch.distributed.get_rank()
-                default_path = f"/root/hzj/fused_moe_layer{self._layer_id}_rank{rank}.json"
-                trace_path = os.environ.get("PROFILE_FUSED_MOE_OUTPUT", default_path)
-                self._profiler.export_chrome_trace(trace_path)
-                print(f"[FusedMoe profiler] layer={self._layer_id} rank={rank} "
-                      f"active={self._profile_active} steps, timeline saved to {trace_path}")
-                self._profiler = None
+                try:
+                    torch.cuda.synchronize()
+                    self._profiler.__exit__(None, None, None)
+                    rank = 0
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                    ):
+                        rank = torch.distributed.get_rank()
+                    default_path = (
+                        f"/root/hzj/fused_moe_layer{self._layer_id}_rank{rank}.json"
+                    )
+                    trace_path = os.environ.get(
+                        "PROFILE_FUSED_MOE_OUTPUT", default_path
+                    )
+                    self._profiler.export_chrome_trace(trace_path)
+                    print(
+                        f"[FusedMoe profiler] layer={self._layer_id} rank={rank} "
+                        f"active={self._profile_active} steps, timeline saved to {trace_path}"
+                    )
+                except Exception as export_ex:
+                    print(
+                        f"[FusedMoe profiler] layer={self._layer_id} export failed: {export_ex}"
+                    )
+                finally:
+                    self._profiler = None
 
             return output
 
