@@ -364,12 +364,15 @@ class FusedMoe(torch.nn.Module):
                         and torch.distributed.is_initialized()
                     ):
                         rank = torch.distributed.get_rank()
-                    default_path = (
-                        f"/root/hzj/fused_moe_layer{self._layer_id}_rank{rank}.json"
-                    )
-                    trace_path = os.environ.get(
-                        "PROFILE_FUSED_MOE_OUTPUT", default_path
-                    )
+                    filename = f"fused_moe_layer{self._layer_id}_rank{rank}.json"
+                    output_dir = os.environ.get("PROFILE_FUSED_MOE_OUTPUT_DIR", "")
+                    if output_dir:
+                        os.makedirs(output_dir, exist_ok=True)
+                        default_path = os.path.join(output_dir, filename)
+                    else:
+                        default_path = f"/root/hzj/{filename}"
+                    # PROFILE_FUSED_MOE_OUTPUT overrides everything if set explicitly
+                    trace_path = os.environ.get("PROFILE_FUSED_MOE_OUTPUT", default_path)
                     self._profiler.export_chrome_trace(trace_path)
                     print(
                         f"[FusedMoe profiler] layer={self._layer_id} rank={rank} "
